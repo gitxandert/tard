@@ -1,33 +1,37 @@
 use std::{
     env, 
     fs::{self, File},
-    io::{self, BufWriter, Write},
+    io::{self, BufReader, BufWriter, Read, Write},
     path::{Path, PathBuf}
 };
 
 fn main() -> io::Result<()> {
-    let args: Vec<_> = env::args().collect();
-    if args.len() == 1 {
-        println!("tard requires a directory path");
-        return Ok(());
+    let args = parse_args()?;
+
+    match args.cmd {
+        Cmd::Archive => archive(args),
+        Cmd::Extract => extract(args),
     }
+}
 
-    let dir = &args[1];
-    let dir_path = PathBuf::from(Path::new(dir));
-
-    let canonical = dir_path.canonicalize()?;
-    let dir_name = canonical.file_name()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid directory"))?;          
+fn archive(args: Args) -> io::Result<()> {
     let out_path = {
-        let mut p = PathBuf::from(&dir_name);
+        let dir_name = args.input_dir().file_name()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid directory"))?;
+        let output_dir = args.output_dir();
+        let mut p = output_dir.join(&dir_name);
         p.set_extension("tard");
-        p           
+        p
     };  
     let out_file = File::create(&out_path)?;
     let mut writer = BufWriter::new(out_file);
     let mut total_size = 0u64;
-    // top-level path uses dir_path as both root and current dir
-    recurse_dir(&dir_path, &dir_path, &mut writer, &mut total_size)?;
+
+    let root = args.input_dir();
+    let parent = root.parent()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "root has no parent"))?;
+    
+    recurse_dir(parent, root, &mut writer, &mut total_size)?;
     
     let _ = writer.flush();
 
@@ -38,7 +42,7 @@ fn main() -> io::Result<()> {
     
     println!(
         "{} archived from {} to {}", 
-        dir_name.display(), 
+        root.display(), 
         format_size(total_size),
         format_size(out_size)
     );
@@ -47,7 +51,7 @@ fn main() -> io::Result<()> {
 }
 
 fn recurse_dir(
-    root: &Path,
+    root_parent: &Path,
     dir: &Path, 
     writer: &mut BufWriter<File>, 
     total_size: &mut u64
@@ -65,7 +69,7 @@ fn recurse_dir(
         
         if let Ok(metadata) = entry.metadata() {
             if metadata.is_file() {
-                let arc = ArcEntry::new(root, &path)?;
+                let arc = ArcEntry::new(root_parent, &path)?;
                 let p_size = arc.physical_size();
                 let l_size = arc.logical_size();
                 println!(
@@ -78,12 +82,177 @@ fn recurse_dir(
                 arc.write(writer)?
             } else if metadata.is_dir() {
                 let path_buf = PathBuf::from(path);
-                recurse_dir(root, &path_buf, writer, total_size)?
+                recurse_dir(root_parent, &path_buf, writer, total_size)?
             }
         }
     }
 
     Ok(())
+}
+
+fn extract(args: Args) -> io::Result<()> {
+    match args.input_dir().extension() {
+        Some(ext) => {
+            match ext.to_str() {
+                Some("tard") => (),
+                _ => {
+                    println!("Err: input for -x must be a .tard file");
+                    std::process::exit(1);
+                }
+            }
+        }
+        None => {
+            println!("Err: input for -x must be a .tard file");
+            std::process::exit(1);
+        }
+    }
+
+    let in_file = File::open(args.input_dir())?;
+    let mut reader = BufReader::new(in_file);
+
+    let out_path = args.output_dir();
+    let mut created_dirs: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+
+    loop {
+        let path = match parse_path(&mut reader) {
+            Ok(p) => p,
+            Err(e) => {
+                if e.kind() == io::ErrorKind::UnexpectedEof { break; }
+                return Err(e);
+            }
+        };
+        
+        let content = match parse_content(&mut reader) {
+            Ok(c) => c,
+            Err(e) => {
+                if e.kind() == io::ErrorKind::UnexpectedEof { break; }
+                return Err(e);
+            }
+        };
+
+        let dest = out_path.join(&path);
+        let parent = dest.parent().unwrap().to_path_buf();
+        if !created_dirs.contains(&parent) {
+            fs::create_dir_all(&parent)?;
+            created_dirs.insert(parent);
+        }
+        println!("{}", dest.display());
+        fs::write(&dest, &content)?;
+    }
+
+    Ok(())
+}
+
+fn parse_path(reader: &mut BufReader<File>) -> io::Result<PathBuf> {
+    let path_payload = get_payload(reader)?;
+
+    let path_string = String::from_utf8(path_payload)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid UTF-8"))?;
+
+    Ok(PathBuf::from(Path::new(&path_string)))
+}
+
+fn parse_content(reader: &mut BufReader<File>) -> io::Result<Vec<u8>> {
+    get_payload(reader)
+}
+
+fn get_payload(reader: &mut BufReader<File>) -> io::Result<Vec<u8>> {
+    let mut len_bytes = [0u8; 8];
+    reader.read_exact(&mut len_bytes)?;
+
+    let length = u64::from_be_bytes(len_bytes) as usize;
+    let mut payload = vec![0u8; length];
+    reader.read_exact(&mut payload)?;
+
+    Ok(payload)
+}
+
+fn parse_args() -> io::Result<Args> {
+    let mut args = env::args();
+    // skip file
+    let _ = args.next();
+    let args: Vec<_> = args.collect();
+    if args.len() < 2 {
+        println!("tard requires an input directory to archive, an output directory in which to place the archive, and an optional command (default -a/--archive [-x/--extract])");
+        std::process::exit(1);
+    }
+
+    let mut args_struct = Args::new();
+    for a in args {
+        match a.as_str() {
+            "-a" | "--archive" => args_struct.cmd = Cmd::Archive,
+            "-x" | "--extract" => args_struct.cmd = Cmd::Extract,
+            _ => {
+                match args_struct.input_dir {
+                    None => {
+                        let input_path = PathBuf::from(Path::new(&a));
+                        let input_dir = input_path.canonicalize()?;
+                        args_struct.input_dir = Some(input_dir);
+                    }
+                    Some(_) => {
+                        match args_struct.output_dir {
+                            None => {
+                                let output_path = PathBuf::from(Path::new(&a));
+                                let output_dir = output_path.canonicalize()?;
+                                args_struct.output_dir = Some(output_dir);
+                            }
+                            Some(_) => {
+                                println!("Err: can only specify one input dir and one output dir");
+                                std::process::exit(1);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(args_struct)
+}
+
+fn format_size(bytes: u64) -> String {
+    if bytes < 1024 {
+        format!("{} B", bytes)
+    } else if bytes < 1024 * 1024 {
+        format!("{:.2} KB", bytes as f64 / 1024.0)
+    } else if bytes < 1024 * 1024 * 1024 {
+        format!("{:.2} MB", bytes as f64 / (1024.0 * 1024.0))
+    } else {
+        format!("{:.2} GB", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
+    }
+}
+
+// enums, structs
+//
+
+enum Cmd {
+    Archive,
+    Extract,
+}
+
+struct Args {
+    cmd: Cmd,
+    input_dir: Option<PathBuf>,
+    output_dir: Option<PathBuf>,
+}
+
+impl Args {
+    fn new() -> Self {
+        Self {
+            // default Archive
+            cmd: Cmd::Archive,
+            input_dir: None,
+            output_dir: None,
+        }
+    }
+
+    fn input_dir(&self) -> &Path {
+        self.input_dir.as_ref().unwrap()
+    }
+
+    fn output_dir(&self) -> &Path {
+        self.output_dir.as_ref().unwrap()
+    }
 }
 
 struct ArcEntry {
@@ -96,8 +265,8 @@ struct ArcEntry {
 }
 
 impl ArcEntry {
-    fn new(root: &Path, path: &Path) -> io::Result<Self> {
-        let rel_path = path.strip_prefix(root)
+    fn new(root_parent: &Path, path: &Path) -> io::Result<Self> {
+        let rel_path = path.strip_prefix(root_parent)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path not under root"))?;
 
         let path_string = rel_path.to_string_lossy().into_owned();
@@ -181,14 +350,3 @@ impl ArcEntry {
     }
 }
 
-fn format_size(bytes: u64) -> String {
-    if bytes < 1024 {
-        format!("{} B", bytes)
-    } else if bytes < 1024 * 1024 {
-        format!("{:.2} KB", bytes as f64 / 1024.0)
-    } else if bytes < 1024 * 1024 * 1024 {
-        format!("{:.2} MB", bytes as f64 / (1024.0 * 1024.0))
-    } else {
-        format!("{:.2} GB", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
-    }
-}
