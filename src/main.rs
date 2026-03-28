@@ -1,8 +1,10 @@
 use std::{
-    env, 
+    env,
+    thread,
+    sync::mpsc,
     fs::{self, File},
+    path::{Path, PathBuf},
     io::{self, BufReader, BufWriter, Read, Write},
-    path::{Path, PathBuf}
 };
 
 fn main() -> io::Result<()> {
@@ -15,6 +17,7 @@ fn main() -> io::Result<()> {
 }
 
 fn archive(args: Args) -> io::Result<()> {
+    // create file to write to
     let out_path = {
         let dir_name = args.input_dir().file_name()
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid directory"))?;
@@ -23,38 +26,102 @@ fn archive(args: Args) -> io::Result<()> {
         p.set_extension("tard");
         p
     };  
-    let out_file = File::create(&out_path)?;
-    let mut writer = BufWriter::new(out_file);
-    let mut total_size = 0u64;
+    let mut out_file = File::create(&out_path)?;
 
+    // get root and parent (for formatting paths)
     let root = args.input_dir();
     let parent = root.parent()
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "root has no parent"))?;
     
-    recurse_dir(parent, root, &mut writer, &mut total_size)?;
-    
-    let _ = writer.flush();
+    // collect all paths
+    let mut paths: Vec<PathBuf> = Vec::new();
+    println!("Collecting paths...");
+    match recurse_dir(root, &mut paths) {
+        Ok(_) => println!("Found {} paths", paths.len()),
+        Err(e) => {
+            println!(
+                "Err -- could not recurse {}: {}",
+                root.display(),
+                e
+            );
+            std::process::exit(1);
+        }
+    }
 
-    let out_size = writer
-        .into_inner()?
-        .metadata()?
-        .len();
-    
-    println!(
-        "{} archived from {} to {}", 
-        root.display(), 
-        format_size(total_size),
-        format_size(out_size)
-    );
-    
+
+    let (path_tx, path_rx) = mpsc::channel::<PathBuf>();
+    let (mem_tx, mem_rx) = mpsc::channel::<Vec<u8>>();
+    let (write_tx, write_rx) = mpsc::sync_channel::<Vec<u8>>(num_workers);
+
+    let num_workers = 8;
+    let num_buffers = num_workers * 4; // Give some extra "slack" for the BTreeMap
+    let chunk_size = 512 * 1024;
+    let total_size = num_buffers * chunk_size;
+
+    // arena-type allocation
+    // 1. One giant allocation
+    let mut massive_block = Vec::with_capacity(total_size);
+    // Safety: "initialize" it
+    massive_block.resize(total_size, 0u8); 
+
+    // 2. Carve it up into buffers and send to the recycle bin
+    let mut current_block = massive_block;
+    for _ in 0..num_buffers {
+        // Take the last 512KB off the big block
+        let buffer_data = current_block.split_off(current_block.len() - chunk_size);
+        
+        // Convert to a Vec that the workers can use
+        // clear() sets length to 0 but keeps the chunk_size capacity
+        let mut buf = buffer_data;
+        buf.clear(); 
+        
+        idle_tx.send(buf).unwrap();
+    }
+
+    for p in paths {
+        path_tx.send(p).unwrap();
+    }
+
+    for i in 0..num_workers {
+        let write_tx = write_tx.clone();
+        let path_rx = path_rx.clone();
+        let mem_rx = mem_rx.clone();
+        let root_parent = parent.clone();
+        
+        thread::spawn(move || {
+            let mut buf = mem_rx.recv()
+                .map_err(|_| "Recycle channel closed")?;
+            loop {
+                for path in path_rx {
+                   let file = match File::open(&path) {
+                       Okay(p) => p,
+                       Err(e) => {
+                           eprintln!(
+                               "Err -- problem with {}: {}",
+                               path.display(),
+                               e
+                            );
+                            continue;
+                        }
+                    };
+                }
+            }
+        });
+    }
+    drop(tx);
+
+    let mut total_physical_size = 0u64;
+
+    for arc_entry in rx {
+        
+    }
+
     Ok(())
 }
 
 fn recurse_dir(
-    root_parent: &Path,
-    dir: &Path, 
-    writer: &mut BufWriter<File>, 
-    total_size: &mut u64
+    dir: &Path,
+    paths: &mut Vec<PathBuf>
 ) -> io::Result<()> {
     for entry in fs::read_dir(dir)? {
         let entry = match entry {
@@ -66,23 +133,22 @@ fn recurse_dir(
         };
 
         let path = entry.path();
+        let path_buf = PathBuf::from(path);
         
         if let Ok(metadata) = entry.metadata() {
             if metadata.is_file() {
-                let arc = ArcEntry::new(root_parent, &path)?;
-                let p_size = arc.physical_size();
-                let l_size = arc.logical_size();
-                println!(
-                    "archiving {} ({} as {})...", 
-                    arc.path(), 
-                    format_size(p_size),
-                    format_size(l_size)
-                );
-                *total_size += p_size;
-                arc.write(writer)?
+                paths.push(path_buf);
             } else if metadata.is_dir() {
-                let path_buf = PathBuf::from(path);
-                recurse_dir(root_parent, &path_buf, writer, total_size)?
+                match recurse_dir(&path_buf, paths) {
+                    Ok(_) => (),
+                    Err(e) => {
+                        eprintln!(
+                            "Err -- could not recurse {}: {}",
+                            path_buf.display(),
+                            e
+                        );
+                    }
+                }
             }
         }
     }
@@ -255,98 +321,8 @@ impl Args {
     }
 }
 
-struct ArcEntry {
-    path_string: String,
-    path_len: u64,
-    path_bytes: Vec<u8>,
-    content_len: u64,
-    content: Vec<u8>,
-    physical_size: u64,
-}
-
-impl ArcEntry {
-    fn new(root_parent: &Path, path: &Path) -> io::Result<Self> {
-        let rel_path = path.strip_prefix(root_parent)
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path not under root"))?;
-
-        let path_string = rel_path.to_string_lossy().into_owned();
-        let path_bytes = path_string.as_bytes().to_vec();
-        let path_len = path_bytes.len() as u64;
-        let content = fs::read(path)?;
-        let content_len = content.len() as u64;
-        let physical_size = Self::get_physical_size(&path)?;
-        Ok(Self {
-            path_string,
-            path_len,
-            path_bytes,
-            content_len,
-            content,
-            physical_size
-        })
-    }
-
-    fn logical_size(&self) -> u64 {
-        self.content_len
-    }
-
-    fn physical_size(&self) -> u64 {
-       self.physical_size 
-    }
-
-    fn path(&self) -> &str {
-        &self.path_string
-    }
-
-    fn write(&self, writer: &mut BufWriter<File>) -> io::Result<()> {
-        let path_len_bytes = Self::spit_u64(self.path_len);
-        let content_len_bytes = Self::spit_u64(self.content_len);
-        
-        writer.write_all(&path_len_bytes)?;
-        writer.write_all(&self.path_bytes)?;
-        writer.write_all(&content_len_bytes)?;
-        writer.write_all(&self.content)?;
-        
-        Ok(())
-    }
-
-    fn spit_u64(long: u64) -> [u8; 8] {
-        let mut spit = [0u8; 8];
-        for i in 0..8 {
-            spit[i] = (long >> 8 * (7 - i)) as u8;
-        }
-
-        spit
-    }
-
-    fn get_physical_size(path: &Path) -> std::io::Result<u64> {
-        let metadata = fs::metadata(path)?;
-        let logical_size = metadata.len();
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::MetadataExt;
-            // Unix blocks are traditionally 512 bytes for this API
-            Ok(metadata.blocks() * 512)
-        }
-
-        #[cfg(windows)]
-        {
-            // Standard Windows cluster size is 4096 bytes (4KB)
-            let cluster_size = 4096;
-            if logical_size == 0 {
-                Ok(0)
-            } else {
-                // Round up to the nearest cluster: (size + (cluster - 1)) & !(cluster - 1)
-                let occupied = (logical_size + cluster_size - 1) & !(cluster_size - 1);
-                Ok(occupied)
-            }
-        }
-
-        #[cfg(not(any(unix, windows)))]
-        {
-            // Fallback for other OSs (WASM, etc.) just returns logical size
-            Ok(logical_size)
-        }
-    }
+struct Package {
+    data: Vec<u8>,
+    is_last: bool,
 }
 
