@@ -1,10 +1,10 @@
 use std::{
-    thread,
-    sync::mpsc,
     fs::{self, File},
     path::{Path, PathBuf},
     io::{self, Read, Write},
+    thread::{self, JoinHandle},
     collections::{VecDeque, BTreeMap},
+    sync::mpsc::{self, Receiver, Sender, SyncSender},
 };
 use crate::cli::Args;
 
@@ -22,7 +22,7 @@ pub fn archive(args: Args) -> io::Result<()> {
 
     // get root and parent (for formatting paths)
     let root = args.input_dir();
-    let parent = root.parent()
+    let root_parent = root.parent()
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "root has no parent"))?;
     
     // collect all paths
@@ -47,10 +47,19 @@ pub fn archive(args: Args) -> io::Result<()> {
     let total_size = num_buffers * chunk_size;
 
     // three channels for routing ordered paths, pre-allocated buffers, and packages
-    let (path_tx, path_rx) = mpsc::channel::<OrdPath>();
-    let (buf_tx, buf_rx) = mpsc::channel::<Vec<u8>>();
+    let (path_tx, path_rx) = crossbeam_channel::unbounded::<OrdPath>();
+    let (buf_tx, buf_rx) = crossbeam_channel::unbounded::<Vec<u8>>();
     let (write_tx, write_rx) = mpsc::sync_channel::<Package>(num_workers);
-    
+
+    for _ in 0..paths.len() {
+        match paths.pop_front() {
+            Some(p) => path_tx.send(p).unwrap(),
+            None => break,
+        }
+    }
+    drop(path_tx);
+    drop(paths);
+
     // arena-type allocation
     // 1. One giant allocation
     let mut massive_block = Vec::with_capacity(total_size);
@@ -71,50 +80,70 @@ pub fn archive(args: Args) -> io::Result<()> {
         buf_tx.send(buf).unwrap();
     }
 
-    for _ in 0..paths.len() {
-        match paths.pop_front() {
-            Some(p) => path_tx.send(p).unwrap(),
-            None => break,
-        }
-    }
-
-    /*
-    for i in 0..num_workers {
+    let mut handles = Vec::<JoinHandle<io::Result<()>>>::with_capacity(num_workers);
+    for thread_id in 0..num_workers {
         let write_tx = write_tx.clone();
         let path_rx = path_rx.clone();
-        let mem_rx = mem_rx.clone();
-        let root_parent = parent.clone();
-        let chunk_size = chunk_size.clone();
-        
-        thread::spawn(move || {
-            let mut buf = mem_rx.recv()
-                .map_err(|_| "Recycle channel closed")?;
-            loop {
-                for path in path_rx {
-                   let file = match File::open(&path) {
-                       Okay(p) => p,
-                       Err(e) => {
-                           eprintln!(
-                               "Err -- problem with {}: {}",
-                               path.display(),
-                               e
-                            );
-                            continue;
-                        }
-                    };
-                }
-            }
-        });
-    }
-    drop(tx);
+        let buf_rx = buf_rx.clone();
+    
+        let handle = spawn_archive_thread(
+            thread_id,
+            write_tx,
+            path_rx,
+            buf_rx,
+            &root_parent,
+            chunk_size
+        );
 
+        handles.push(handle);
+    }
+    drop(write_tx);
+    drop(path_rx);
+    drop(buf_rx);
+
+
+    for handle in handles {
+        handle.join().expect("Worker thread panicked");
+    }
+
+    println!("Processed all paths");
+    /*
     let mut total_physical_size = 0u64;
 
     for arc_entry in rx {
         
     }
-*/
+    */
+    
     Ok(())
+}
+
+fn spawn_archive_thread(
+    thread_id: usize,
+    write_tx: SyncSender<Package>,
+    path_rx: crossbeam_channel::Receiver<OrdPath>,
+    buf_rx: crossbeam_channel::Receiver<Vec<u8>>,
+    root_parent: &Path,
+    chunk_size: usize
+) -> JoinHandle<io::Result<()>> {
+    return thread::spawn(move || -> io::Result<()> {
+        // Grab an initial buffer
+        let mut buf = match buf_rx.recv() {
+            Ok(b) => b,
+            Err(_) => return Ok(()), // Channel closed, exit gracefully
+        };
+
+        // This loop automatically handles multiple consumers fairly
+        for path in path_rx {
+            println!("Thread {} opened {}", thread_id, path.display());
+
+            // TODO: Work logic here
+            // Once done with a chunk, you'd send 'buf' to write_tx
+            // and recv a new 'buf' from buf_rx to continue.
+        }
+
+        Ok(())
+    });
 }
 
 fn recurse_dir(
@@ -166,6 +195,14 @@ struct OrdPath {
 impl OrdPath {
     fn new(path: PathBuf, id: usize) -> Self {
         Self { path, id, }
+    }
+
+    fn display(&self) -> std::path::Display {
+        self.path.display()
+    }
+
+    fn refer(&self) -> &Path {
+        &self.path
     }
 }
 
