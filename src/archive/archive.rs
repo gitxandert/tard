@@ -1,12 +1,14 @@
 use std::{
+    io,
     fs::{self, File},
     path::{Path, PathBuf},
-    io::{self, Read, Write},
+    os::unix::ffi::OsStrExt,
     thread::{self, JoinHandle},
+    sync::mpsc::{self, SyncSender},
     collections::{VecDeque, BTreeMap},
-    sync::mpsc::{self, Receiver, Sender, SyncSender},
 };
 use crate::cli::Args;
+use crate::utils::formatting::format_size;
 
 pub fn archive(args: Args) -> io::Result<()> {
     // create file to write to
@@ -85,14 +87,15 @@ pub fn archive(args: Args) -> io::Result<()> {
         let write_tx = write_tx.clone();
         let path_rx = path_rx.clone();
         let buf_rx = buf_rx.clone();
-    
+        let root_parent = PathBuf::from(root_parent);
+
         let handle = spawn_archive_thread(
             thread_id,
             write_tx,
             path_rx,
             buf_rx,
-            &root_parent,
-            chunk_size
+            root_parent,
+            chunk_size as u64
         );
 
         handles.push(handle);
@@ -101,20 +104,29 @@ pub fn archive(args: Args) -> io::Result<()> {
     drop(path_rx);
     drop(buf_rx);
 
+    use std::io::Write;
 
-    for handle in handles {
-        handle.join().expect("Worker thread panicked");
-    }
-
-    println!("Processed all paths");
-    /*
-    let mut total_physical_size = 0u64;
-
-    for arc_entry in rx {
+    let mut write_buffer = TardBuffer::new(chunk_size * 4);
+    for mut package in write_rx {
+        println!("Received package for path {}, chunk {}", package.path_id, package.chunk_id);
         
+        while package.len() > write_buffer.space_left() {
+            write_buffer.fill(&mut package.data, write_buffer.space_left());
+            out_file.write_all(&write_buffer.buf)?;
+            write_buffer.clear();
+        }
+
+        if let Err(_) = buf_tx.send(package.data) {
+            continue;
+        }
     }
-    */
     
+    for handle in handles {
+        let _ = handle.join().expect("Worker thread panicked");
+    }
+    
+    println!("Finished writing to {}", out_path.display());
+
     Ok(())
 }
 
@@ -123,23 +135,67 @@ fn spawn_archive_thread(
     write_tx: SyncSender<Package>,
     path_rx: crossbeam_channel::Receiver<OrdPath>,
     buf_rx: crossbeam_channel::Receiver<Vec<u8>>,
-    root_parent: &Path,
-    chunk_size: usize
+    root_parent: PathBuf,
+    chunk_size: u64
 ) -> JoinHandle<io::Result<()>> {
+    use std::io::Read;
     return thread::spawn(move || -> io::Result<()> {
-        // Grab an initial buffer
-        let mut buf = match buf_rx.recv() {
-            Ok(b) => b,
-            Err(_) => return Ok(()), // Channel closed, exit gracefully
-        };
-
-        // This loop automatically handles multiple consumers fairly
         for path in path_rx {
-            println!("Thread {} opened {}", thread_id, path.display());
+            // 1. open file
+            // 2. get filename (relative to root_parent)
+            // 3. get length of filename and file content
+            // 4. store filename_length, filename, and content_len as header
+            // 5. take from header and file until either:
+            //  -a: all content is read
+            //  -b: buf is full
+            // 6. if all content is read and buf is not full, send Package with is_last set to true
+            // 7. if not all content is read and buf is full, send Package with is_last set to false
+            //  -- keep reading from file and sending Packages until all content is read
+            //  -- increment chunk_id with each Package until the last
+            let mut buf = match buf_rx.recv() {
+                Ok(b) => b,
+                Err(_) => return Ok(()), // Channel closed, exit gracefully
+            };
+            
+            let path_ref = path.refer();
+            let mut file = File::open(path_ref)?;
+            
+            let path_rel = path.path.strip_prefix(&root_parent).unwrap();
+            let path_bytes = path_rel.as_os_str().as_bytes();
+            let path_len = path_bytes.len() as u64;
+            for i in 0..8 {
+                buf.push((path_len >> 8 * i) as u8);
+            }
+            buf.extend_from_slice(path_bytes);
+            
+            let file_len = file.metadata()?.len();
+            for i in 0..8 {
+                buf.push((file_len >> 8 * i) as u8);
+            }
+            
+            println!("Thread {} opened path {} ({})", thread_id, path.display(), format_size(file_len));
+            
+            let mut chunk_id = 0;
+            let mut cur_len = file_len;
+            let header_len = 16_u64 + path_len;
+            let mut read_len = cur_len.min(chunk_size - header_len);
+            while cur_len > chunk_size {
+                file.by_ref().take(read_len).read_to_end(&mut buf)?;
 
-            // TODO: Work logic here
-            // Once done with a chunk, you'd send 'buf' to write_tx
-            // and recv a new 'buf' from buf_rx to continue.
+                write_tx.send(Package::new(buf, path.id, chunk_id, false)).unwrap();
+
+                buf = match buf_rx.recv() {
+                    Ok(b) => b,
+                    Err(_) => return Ok(()), // Channel closed, exit gracefully
+                };
+
+                chunk_id += 1;
+                cur_len -= read_len;
+                read_len = cur_len.min(chunk_size);
+            }
+
+            file.by_ref().take(read_len).read_to_end(&mut buf)?;
+            write_tx.send(Package::new(buf, path.id, chunk_id, true)).unwrap();
         }
 
         Ok(())
@@ -197,7 +253,7 @@ impl OrdPath {
         Self { path, id, }
     }
 
-    fn display(&self) -> std::path::Display {
+    fn display(&self) -> std::path::Display<'_> {
         self.path.display()
     }
 
@@ -249,4 +305,41 @@ struct Package {
     path_id: usize,
     chunk_id: usize,
     is_last: bool,
+}
+
+impl Package {
+    fn new(data: Vec<u8>, path_id: usize, chunk_id: usize, is_last: bool) -> Self {
+        Self { data, path_id, chunk_id, is_last }
+    }
+
+    fn len(&self) -> usize {
+        self.data.len()
+    }
+}
+
+// write buffer for received Packages
+struct TardBuffer {
+    buf: Vec<u8>,
+    capacity: usize,
+}
+
+impl TardBuffer {
+    fn new(capacity: usize) -> Self {
+        Self {
+            buf: Vec::with_capacity(capacity),
+            capacity
+        }
+    }
+
+    fn fill(&mut self, data: &mut Vec<u8>, take: usize) {
+        self.buf.extend(data.drain(0..take));
+    }
+
+    fn space_left(&self) -> usize {
+        self.capacity.saturating_sub(self.buf.len())
+    }
+
+    fn clear(&mut self) {
+        self.buf.clear();
+    }
 }
