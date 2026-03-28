@@ -104,20 +104,19 @@ pub fn archive(args: Args) -> io::Result<()> {
     drop(path_rx);
     drop(buf_rx);
 
-    use std::io::Write;
-
-    let mut write_buffer = TardBuffer::new(chunk_size * 4);
+    let mut write_buffer = TardWriter::new(out_file, chunk_size * 4, buf_tx);
     for mut package in write_rx {
         println!("Received package for path {}, chunk {}", package.path_id, package.chunk_id);
-        
-        while package.len() > write_buffer.space_left() {
-            write_buffer.fill(&mut package.data, write_buffer.space_left());
-            out_file.write_all(&write_buffer.buf)?;
-            write_buffer.clear();
-        }
-
-        if let Err(_) = buf_tx.send(package.data) {
-            continue;
+       
+        write_buffer.insert(package);
+        if let Err(error) = write_buffer.write_packages() {
+            match error {
+                TardError::Io(e) => {
+                    eprintln!("Err -- I/O: {}", e);
+                    std::process::exit(1);
+                }
+                TardError::ChannelClosed => continue,
+            }
         }
     }
     
@@ -139,6 +138,7 @@ fn spawn_archive_thread(
     chunk_size: u64
 ) -> JoinHandle<io::Result<()>> {
     use std::io::Read;
+
     return thread::spawn(move || -> io::Result<()> {
         for path in path_rx {
             // 1. open file
@@ -158,7 +158,13 @@ fn spawn_archive_thread(
             };
             
             let path_ref = path.refer();
-            let mut file = File::open(path_ref)?;
+            let mut file = match File::open(path_ref) {
+                Ok(f) => f,
+                Err(e) => {
+                    println!("Err -- unable to open {}: {}", path.display(), e);
+                    continue;
+                }
+            };
             
             let path_rel = path.path.strip_prefix(&root_parent).unwrap();
             let path_bytes = path_rel.as_os_str().as_bytes();
@@ -168,19 +174,36 @@ fn spawn_archive_thread(
             }
             buf.extend_from_slice(path_bytes);
             
-            let file_len = file.metadata()?.len();
+            let file_len = match file.metadata() {
+                Ok(m) => m.len(),
+                Err(e) => {
+                    println!("Err -- problem getting metadata for {}: {}", path.display(), e);
+                    continue;
+                }
+            };
             for i in 0..8 {
                 buf.push((file_len >> 8 * i) as u8);
             }
             
-            println!("Thread {} opened path {} ({})", thread_id, path.display(), format_size(file_len));
+            println!(
+                "Thread {} opened path {} ({})", 
+                thread_id, 
+                path.display(), 
+                format_size(file_len)
+            );
             
             let mut chunk_id = 0;
             let mut cur_len = file_len;
             let header_len = 16_u64 + path_len;
             let mut read_len = cur_len.min(chunk_size - header_len);
             while cur_len > chunk_size {
-                file.by_ref().take(read_len).read_to_end(&mut buf)?;
+                match file.by_ref().take(read_len).read_to_end(&mut buf) {
+                    Ok(_) => (),
+                    Err(e) => {
+                        println!("Err -- problem reading from {}: {}", path.display(), e);
+                        break;
+                    }
+                }
 
                 write_tx.send(Package::new(buf, path.id, chunk_id, false)).unwrap();
 
@@ -194,7 +217,13 @@ fn spawn_archive_thread(
                 read_len = cur_len.min(chunk_size);
             }
 
-            file.by_ref().take(read_len).read_to_end(&mut buf)?;
+            match file.by_ref().take(read_len).read_to_end(&mut buf) {
+                Ok(_) => (),
+                Err(e) => {
+                    println!("Err -- problem reading from {}: {}", path.display(), e);
+                    continue;
+                }
+            }
             write_tx.send(Package::new(buf, path.id, chunk_id, true)).unwrap();
         }
 
@@ -317,21 +346,50 @@ impl Package {
     }
 }
 
-// write buffer for received Packages
-struct TardBuffer {
-    buf: Vec<u8>,
-    capacity: usize,
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
+struct PackageKey {
+    id: usize,
+    chunk: usize,
 }
 
-impl TardBuffer {
-    fn new(capacity: usize) -> Self {
+impl PackageKey {
+    fn new(id: usize, chunk: usize) -> Self {
+        Self { id, chunk }
+    }
+
+    fn inc_id(&mut self) {
+        self.id += 1;
+        self.chunk = 0;
+    }
+
+    fn inc_chunk(&mut self) {
+        self.chunk += 1;
+    }
+}
+
+// writer for received Packages
+struct TardWriter {
+    out_file: File,
+    buf: Vec<u8>,
+    buf_tx: crossbeam_channel::Sender<Vec<u8>>,
+    capacity: usize,
+    queue: BTreeMap<PackageKey, Package>,
+    cur_key: PackageKey
+}
+
+impl TardWriter {
+    fn new(out_file: File, capacity: usize, buf_tx: crossbeam_channel::Sender<Vec<u8>>) -> Self {
         Self {
+            out_file,
             buf: Vec::with_capacity(capacity),
-            capacity
+            buf_tx,
+            capacity,
+            queue: BTreeMap::<PackageKey, Package>::new(),
+            cur_key: PackageKey::new(0usize, 0usize)
         }
     }
 
-    fn fill(&mut self, data: &mut Vec<u8>, take: usize) {
+    fn fill_buffer(&mut self, data: &mut Vec<u8>, take: usize) {
         self.buf.extend(data.drain(0..take));
     }
 
@@ -341,5 +399,68 @@ impl TardBuffer {
 
     fn clear(&mut self) {
         self.buf.clear();
+    }
+
+    fn insert(&mut self, package: Package) {
+        let id = package.path_id;
+        let chunk = package.chunk_id;
+        self.queue.insert(PackageKey::new(id, chunk), package);
+    }
+
+    fn write_packages(&mut self) -> Result<(), TardError> {
+        use std::io::Write;
+
+        while let Some(mut package) = self.queue.remove(&self.cur_key) {
+            while package.len() > self.space_left() {
+                self.fill_buffer(&mut package.data, self.space_left());
+                self.out_file.write_all(&self.buf)?;
+                self.clear();
+            }
+            println!("Wrote path {}, chunk {} to file", self.cur_key.id, self.cur_key.chunk);
+            if package.is_last {
+                self.cur_key.inc_id();
+            } else {
+                self.cur_key.inc_chunk();
+            }
+
+            if let Err(e) = self.buf_tx.send(package.data) {
+                return Err(TardError::ChannelClosed);
+            }
+        }
+
+        Ok(())
+    }
+}
+
+use std::fmt;
+use std::io::{Error, ErrorKind};
+
+#[derive(Debug)]
+enum TardError {
+    Io(Error),
+    ChannelClosed,
+}
+
+impl fmt::Display for TardError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            TardError::Io(err) => write!(f, "I/O error: {}", err),
+            TardError::ChannelClosed => write!(f, "Channel closed"),
+        }
+    }
+}
+
+impl std::error::Error for TardError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            TardError::Io(err) => Some(err),
+            _ => None,
+        }
+    }
+}
+
+impl From<Error> for TardError {
+    fn from(err: Error) -> Self {
+        TardError::Io(err)
     }
 }
