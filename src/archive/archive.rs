@@ -44,8 +44,8 @@ pub fn archive(args: Args) -> io::Result<()> {
 
     // make num_workers and total_size be CLI arguments
     let num_workers = 8;
-    let num_buffers = num_workers * 2; // Give some "slack" for the BTreeMap
-    let chunk_size = 512 * 1024;
+    let num_buffers = num_workers * 20; // Give some "slack" for the BTreeMap
+    let chunk_size = 1024 * 1024;
     let total_size = num_buffers * chunk_size;
 
     // three channels for routing ordered paths, pre-allocated buffers, and packages
@@ -104,7 +104,7 @@ pub fn archive(args: Args) -> io::Result<()> {
     drop(path_rx);
     drop(buf_rx);
 
-    let mut write_buffer = TardWriter::new(out_file, chunk_size * 4, buf_tx);
+    let mut write_buffer = TardWriter::new(out_file, chunk_size * 10, buf_tx);
     for mut package in write_rx {
         println!("Received package for path {}, chunk {}", package.path_id, package.chunk_id);
        
@@ -411,12 +411,15 @@ impl TardWriter {
         use std::io::Write;
 
         while let Some(mut package) = self.queue.remove(&self.cur_key) {
+            let mut take = package.len().min(self.space_left());
+            self.fill_buffer(&mut package.data, take);
             while package.len() > self.space_left() {
-                self.fill_buffer(&mut package.data, self.space_left());
                 self.out_file.write_all(&self.buf)?;
                 self.clear();
+                take = package.len().min(self.space_left());
+                self.fill_buffer(&mut package.data, take);
             }
-            println!("Wrote path {}, chunk {} to file", self.cur_key.id, self.cur_key.chunk);
+            println!("Siphoned path {}, chunk {}", self.cur_key.id, self.cur_key.chunk);
             if package.is_last {
                 self.cur_key.inc_id();
             } else {
