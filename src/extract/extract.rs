@@ -6,7 +6,16 @@ use std::{
 use crate::cli::Args;
 
 pub fn extract(args: Args) -> io::Result<()> {
-    match args.input_dir().extension() {
+    // validate args
+    let input = match args.input_dir() {
+        Some(f) => f,
+        None => return Err(io::Error::new(io::ErrorKind::InvalidInput, "no input directory provided")),
+    };
+    let out_path = match args.output_dir() {
+        Some(dir) => dir,
+        None => return Err(io::Error::new(io::ErrorKind::InvalidInput, "no output directory provided")),
+    };
+    match input.extension() {
         Some(ext) => {
             match ext.to_str() {
                 Some("tard") => (),
@@ -22,10 +31,9 @@ pub fn extract(args: Args) -> io::Result<()> {
         }
     }
 
-    let in_file = File::open(args.input_dir())?;
+    let in_file = File::open(input)?;
     let mut reader = BufReader::new(in_file);
 
-    let out_path = args.output_dir();
     let mut created_dirs: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
 
     loop {

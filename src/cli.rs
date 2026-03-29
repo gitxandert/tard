@@ -80,11 +80,17 @@ impl Args {
         }
     }
 
-    pub fn input_dir(&self) -> &Path {
-        self.input_dir.as_ref().unwrap()
+    pub fn input_dir(&self) -> Option<&Path> {
+        match &self.input_dir {
+            Some(dir) => Some(dir),
+            None => None,
+        }
     }
 
-    pub fn output_dir(&self) -> &Path {
-        self.output_dir.as_ref().unwrap()
+    pub fn output_dir(&self) -> Option<&Path> {
+        match &self.output_dir {
+            Some(dir) => Some(dir),
+            None => None,
+        }
     }
 }

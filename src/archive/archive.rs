@@ -11,19 +11,26 @@ use crate::cli::Args;
 use crate::utils::formatting::format_size;
 
 pub fn archive(args: Args) -> io::Result<()> {
+    // validate args
+    let root = match args.input_dir() {
+        Some(dir) => dir,
+        None => return Err(io::Error::new(io::ErrorKind::InvalidInput, "no input directory provided")),
+    };
+    let output_dir = match args.output_dir() {
+        Some(dir) => dir,
+        None => return Err(io::Error::new(io::ErrorKind::InvalidInput, "no output directory provided")),
+    };
     // create file to write to
     let out_path = {
-        let dir_name = args.input_dir().file_name()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid directory"))?;
-        let output_dir = args.output_dir();
+        let dir_name = root.file_name()
+                        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid directory"))?;
         let mut p = output_dir.join(&dir_name);
         p.set_extension("tard");
         p
     };  
-    let mut out_file = File::create(&out_path)?;
+    let out_file = File::create(&out_path)?;
 
-    // get root and parent (for formatting paths)
-    let root = args.input_dir();
+    // get root parent for formatting paths
     let root_parent = root.parent()
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "root has no parent"))?;
     
@@ -105,7 +112,7 @@ pub fn archive(args: Args) -> io::Result<()> {
     drop(buf_rx);
 
     let mut write_buffer = TardWriter::new(out_file, chunk_size * 10, buf_tx);
-    for mut package in write_rx {
+    for package in write_rx {
         println!("Received package for path {}, chunk {}", package.path_id, package.chunk_id);
        
         write_buffer.insert(package);
@@ -426,7 +433,7 @@ impl TardWriter {
                 self.cur_key.inc_chunk();
             }
 
-            if let Err(e) = self.buf_tx.send(package.data) {
+            if let Err(_) = self.buf_tx.send(package.data) {
                 return Err(TardError::ChannelClosed);
             }
         }
@@ -436,7 +443,7 @@ impl TardWriter {
 }
 
 use std::fmt;
-use std::io::{Error, ErrorKind};
+use std::io::Error;
 
 #[derive(Debug)]
 enum TardError {
