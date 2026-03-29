@@ -51,23 +51,22 @@ pub fn archive(args: Args) -> io::Result<()> {
 
     // make num_workers and total_size be CLI arguments
     let num_workers = 8;
-    let num_buffers = num_workers * 20; // Give some "slack" for the BTreeMap
+    let num_buffers = num_workers * 4; // Give some "slack" for the BTreeMap
     let chunk_size = 1024 * 1024;
     let total_size = num_buffers * chunk_size;
 
     // three channels for routing ordered paths, pre-allocated buffers, and packages
-    let (path_tx, path_rx) = crossbeam_channel::unbounded::<OrdPath>();
+    // path_tx is bounded to num_workers: workers can only be num_workers files ahead of the writer,
+    // which bounds BTreeMap depth and prevents buffer exhaustion on large files.
+    let (path_tx, path_rx) = crossbeam_channel::bounded::<OrdPath>(num_workers);
     let (buf_tx, buf_rx) = crossbeam_channel::unbounded::<Vec<u8>>();
     let (write_tx, write_rx) = mpsc::sync_channel::<Package>(num_workers);
 
-    for _ in 0..paths.len() {
-        match paths.pop_front() {
-            Some(p) => path_tx.send(p).unwrap(),
-            None => break,
-        }
+    // Pre-seed the channel with the first num_workers paths; the rest are dispatched
+    // by the writer loop as files complete.
+    for _ in 0..num_workers.min(paths.len()) {
+        path_tx.send(paths.pop_front().unwrap()).unwrap();
     }
-    drop(path_tx);
-    drop(paths);
 
     // arena-type allocation
     // 1. One giant allocation
@@ -111,19 +110,35 @@ pub fn archive(args: Args) -> io::Result<()> {
     drop(path_rx);
     drop(buf_rx);
 
+    // Wrap in Option so we can drop it (closing the channel) once all paths are dispatched.
+    let mut path_tx = Some(path_tx);
+
     let mut write_buffer = TardWriter::new(out_file, chunk_size * 10, buf_tx);
     for package in write_rx {
         println!("Received package for path {}, chunk {}", package.path_id, package.chunk_id);
-       
+
         write_buffer.insert(package);
-        if let Err(error) = write_buffer.write_packages() {
-            match error {
-                TardError::Io(e) => {
-                    eprintln!("Err -- I/O: {}", e);
-                    std::process::exit(1);
+        match write_buffer.write_packages() {
+            Ok(completed) => {
+                if let Some(tx) = path_tx.as_ref() {
+                    // Dispatch one new path for each file the writer just finished.
+                    for _ in 0..completed {
+                        match paths.pop_front() {
+                            Some(p) => tx.send(p).unwrap(),
+                            None => break,
+                        }
+                    }
+                    // Close the channel once all paths are dispatched so workers exit.
+                    if paths.len() == 0 {
+                        path_tx = None;
+                    }
                 }
-                TardError::ChannelClosed => continue,
             }
+            Err(TardError::Io(e)) => {
+                eprintln!("Err -- I/O: {}", e);
+                std::process::exit(1);
+            }
+            Err(TardError::ChannelClosed) => continue,
         }
     }
     
@@ -414,9 +429,10 @@ impl TardWriter {
         self.queue.insert(PackageKey::new(id, chunk), package);
     }
 
-    fn write_packages(&mut self) -> Result<(), TardError> {
+    fn write_packages(&mut self) -> Result<usize, TardError> {
         use std::io::Write;
 
+        let mut completed = 0;
         while let Some(mut package) = self.queue.remove(&self.cur_key) {
             let mut take = package.len().min(self.space_left());
             self.fill_buffer(&mut package.data, take);
@@ -429,6 +445,7 @@ impl TardWriter {
             println!("Siphoned path {}, chunk {}", self.cur_key.id, self.cur_key.chunk);
             if package.is_last {
                 self.cur_key.inc_id();
+                completed += 1;
             } else {
                 self.cur_key.inc_chunk();
             }
@@ -438,7 +455,7 @@ impl TardWriter {
             }
         }
 
-        Ok(())
+        Ok(completed)
     }
 }
 
