@@ -9,6 +9,7 @@ use crate::cli::Args;
 use crate::utils::formatting::format_size;
 
 pub fn archive(args: Args) -> io::Result<()> {
+    println!("Archiving...");
     // validate args
     let input_dir = match args.input_dir {
         Some(ref dir) => dir.clone(),
@@ -33,10 +34,11 @@ pub fn archive(args: Args) -> io::Result<()> {
     let root_parent = root.parent()
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "root has no parent"))?;
 
-    let num_workers = 8;
+    let num_workers = args.num_workers;
     let num_buffers = num_workers * 4;
-    let chunk_size = 1024 * 1024;
-    let total_size = num_buffers * chunk_size;
+    let total_size = args.max_ram;
+    let ram_split = total_size / 2;
+    let chunk_size = ram_split / num_buffers;
 
     let (path_tx, path_rx) = crossbeam_channel::unbounded::<PathData>();
     let (buf_tx, buf_rx) = crossbeam_channel::unbounded::<Vec<u8>>();
@@ -45,9 +47,10 @@ pub fn archive(args: Args) -> io::Result<()> {
     // separate thread for collecting paths
     let path_collector = thread::spawn(move || -> io::Result<()> { recurse_dir(&input_dir, path_tx) });
 
+    println!("Allocating {}...", format_size(total_size as u64));
     // Arena allocation: one block carved into num_buffers chunks for regular workers.
-    let mut massive_block = Vec::with_capacity(total_size);
-    massive_block.resize(total_size, 0u8);
+    let mut massive_block = Vec::with_capacity(ram_split);
+    massive_block.resize(ram_split, 0u8);
     let mut current_block = massive_block;
     for _ in 0..num_buffers {
         let buffer_data = current_block.split_off(current_block.len() - chunk_size);
@@ -73,7 +76,7 @@ pub fn archive(args: Args) -> io::Result<()> {
     drop(buf_rx);
     drop(write_tx);
 
-    let mut write_buffer = TardWriter::new(out_file, chunk_size * 10, buf_tx);
+    let mut write_buffer = TardWriter::new(out_file, ram_split, buf_tx);
 
     for package in write_rx {
         println!("Received package for {}", package.path.display());

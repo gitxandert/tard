@@ -1,6 +1,6 @@
 use tard::cli::route_args;
 
-fn main() -> std::io::Result<()> {
+fn main() {
     route_args()
 }
 
