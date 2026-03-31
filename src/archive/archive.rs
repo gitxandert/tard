@@ -29,6 +29,7 @@ pub fn archive(args: Args) -> io::Result<()> {
         p
     };
     let mut out_file = OpenOptions::new()
+        .read(args.resume)
         .write(true)
         .append(args.resume)
         .create(true)
@@ -50,7 +51,7 @@ pub fn archive(args: Args) -> io::Result<()> {
 
     // build ExistingPaths before spawning so out_file stays on main thread
     let mut existing_paths = if args.resume {
-        Some(ExistingPaths::new(&mut out_file))
+        Some(ExistingPaths::new(&mut out_file, root_parent))
     } else {
         None
     };
@@ -237,9 +238,10 @@ struct ExistingPaths {
 }
 
 impl ExistingPaths {
-    fn new(out_file: &mut File) -> Self {
+    fn new(out_file: &mut File, root_parent: &Path) -> Self {
         use std::io::{Read, Seek, SeekFrom};
 
+        let _ = out_file.seek(SeekFrom::Start(0));
         let mut reader = std::io::BufReader::new(&mut *out_file);
         let mut paths: Vec<PathBuf> = Vec::new();
         let mut last_header_pos: u64 = 0;
@@ -274,8 +276,8 @@ impl ExistingPaths {
                 break;
             }
 
-            let path = PathBuf::from(std::ffi::OsString::from_vec(path_bytes));
-            paths.push(path);
+            let rel_path = PathBuf::from(std::ffi::OsString::from_vec(path_bytes));
+            paths.push(root_parent.join(rel_path));
             last_header_pos = pos;
         }
 
