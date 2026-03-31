@@ -1,9 +1,9 @@
 use std::{
     io,
-    fs::{self, File},
     path::{Path, PathBuf},
-    os::unix::ffi::OsStrExt,
+    os::unix::ffi::{OsStrExt, OsStringExt},
     thread::{self, JoinHandle},
+    fs::{self, File, OpenOptions},
 };
 use crate::cli::Args;
 use crate::utils::formatting::format_size;
@@ -28,7 +28,11 @@ pub fn archive(args: Args) -> io::Result<()> {
         p.set_extension("tard");
         p
     };
-    let out_file = File::create(&out_path)?;
+    let mut out_file = OpenOptions::new()
+        .write(true)
+        .append(args.resume)
+        .create(true)
+        .open(&out_path)?;
 
     // get root parent for formatting paths
     let root_parent = root.parent()
@@ -44,8 +48,21 @@ pub fn archive(args: Args) -> io::Result<()> {
     let (buf_tx, buf_rx) = crossbeam_channel::unbounded::<Vec<u8>>();
     let (write_tx, write_rx) = crossbeam_channel::unbounded::<Package>();
 
+    // build ExistingPaths before spawning so out_file stays on main thread
+    let mut existing_paths = if args.resume {
+        Some(ExistingPaths::new(&mut out_file))
+    } else {
+        None
+    };
+
+    if let Some(ref paths) = existing_paths {
+        println!("Found {} encoded paths", paths.paths.len());
+    }
+
     // separate thread for collecting paths
-    let path_collector = thread::spawn(move || -> io::Result<()> { recurse_dir(&input_dir, path_tx) });
+    let path_collector = thread::spawn(move || -> io::Result<()> {
+        recurse_dir(&input_dir, path_tx, existing_paths.as_mut())
+    });
 
     println!("Allocating {}...", format_size(total_size as u64));
     // Arena allocation: one block carved into num_buffers chunks for regular workers.
@@ -169,6 +186,7 @@ fn spawn_archive_thread(
 fn recurse_dir(
     dir: &Path,
     path_rx: crossbeam_channel::Sender<PathData>,
+    mut existing: Option<&mut ExistingPaths>,
 ) -> io::Result<()> {
     for entry in fs::read_dir(dir)? {
         let entry = match entry {
@@ -183,12 +201,18 @@ fn recurse_dir(
 
         if let Ok(metadata) = entry.metadata() {
             if metadata.is_file() {
+                if let Some(ref mut ex) = existing {
+                    if ex.check(&path_buf) {
+                        println!("Skipping encoded file {}", path_buf.display());
+                        continue;
+                    }
+                }
                 let len = metadata.len();
-                if path_rx.send(PathData::new(path_buf, len)).is_err() { 
+                if path_rx.send(PathData::new(path_buf, len)).is_err() {
                     return Ok(());  // channel is closed
                 }
             } else if metadata.is_dir() {
-                match recurse_dir(&path_buf, path_rx.clone()) {
+                match recurse_dir(&path_buf, path_rx.clone(), existing.as_deref_mut()) {
                     Ok(_) => (),
                     Err(e) => {
                         eprintln!(
@@ -207,6 +231,75 @@ fn recurse_dir(
 
 // enums, structs
 //
+
+struct ExistingPaths {
+    paths: Vec<PathBuf>,
+}
+
+impl ExistingPaths {
+    fn new(out_file: &mut File) -> Self {
+        use std::io::{Read, Seek, SeekFrom};
+
+        let mut reader = std::io::BufReader::new(&mut *out_file);
+        let mut paths: Vec<PathBuf> = Vec::new();
+        let mut last_header_pos: u64 = 0;
+
+        loop {
+            let pos = match reader.stream_position() {
+                Ok(p) => p,
+                Err(_) => break,
+            };
+
+            // read 8-byte path_len
+            let mut len_buf = [0u8; 8];
+            if reader.read_exact(&mut len_buf).is_err() {
+                break;
+            }
+            let path_len = u64::from_le_bytes(len_buf);
+
+            // read path_name
+            let mut path_bytes = vec![0u8; path_len as usize];
+            if reader.read_exact(&mut path_bytes).is_err() {
+                break;
+            }
+
+            // read 8-byte content_len
+            if reader.read_exact(&mut len_buf).is_err() {
+                break;
+            }
+            let content_len = u64::from_le_bytes(len_buf);
+
+            // skip content
+            if reader.seek(SeekFrom::Current(content_len as i64)).is_err() {
+                break;
+            }
+
+            let path = PathBuf::from(std::ffi::OsString::from_vec(path_bytes));
+            paths.push(path);
+            last_header_pos = pos;
+        }
+
+        // remove last path and truncate file to erase its header + content
+        if !paths.is_empty() {
+            paths.pop();
+            let _ = out_file.set_len(last_header_pos);
+            let _ = out_file.seek(SeekFrom::End(0));
+        }
+
+        Self { paths }
+    }
+
+    fn check(&mut self, path: &Path) -> bool {
+        for i in 0..self.paths.len() {
+            if path == self.paths[i] {
+                let _ = self.paths.remove(i);
+                return true;
+            }
+        }
+        return false;
+    }
+}
+
 struct PathData {
     path: PathBuf,
     len: u64,

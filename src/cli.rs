@@ -40,7 +40,8 @@ fn parse_args() -> Result<Args, String> {
         match a.as_str() {
             "-a" | "--archive" => args_struct.cmd = Cmd::Archive,
             "-x" | "--extract" => args_struct.cmd = Cmd::Extract,
-            "-r" | "--max_ram" => {
+            "-r" | "--resume"  => args_struct.resume = true,
+            "-m" | "--max_ram" => {
                 if let Some(a) = args.next() {
                     args_struct.max_ram = match parse_ram_arg(&a) {
                         Ok(ram) => ram,
@@ -50,7 +51,7 @@ fn parse_args() -> Result<Args, String> {
                     return Err("unspecified value for -r/--max_ram".to_string());
                 }
             }
-            "-w" | "--num_workers" => {
+            "-n" | "--num_workers" => {
                 if let Some(a) = args.next() {
                     args_struct.num_workers = match a.parse::<usize>() {
                         Ok(d) => d,
@@ -128,6 +129,7 @@ pub struct Args {
     pub output_dir: Option<PathBuf>,
     pub max_ram: usize,
     pub num_workers: usize,
+    pub resume: bool,
 }
 
 impl Args {
@@ -137,8 +139,9 @@ impl Args {
             cmd: Cmd::Archive,
             input_dir: None,
             output_dir: None,
-            max_ram: 1024 * 1024 * 10,
+            max_ram: 1024 * 1024 * 10, // 10MB
             num_workers: 8usize,
+            resume: false,
         }
     }
 
