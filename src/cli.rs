@@ -40,15 +40,15 @@ fn parse_args() -> Result<Args, String> {
         match a.as_str() {
             "-a" | "--archive" => args_struct.cmd = Cmd::Archive,
             "-x" | "--extract" => args_struct.cmd = Cmd::Extract,
-            "-r" | "--resume"  => args_struct.resume = true,
-            "-m" | "--max_ram" => {
+            "-c" | "--continue"  => args_struct.resume = true,
+            "-r" | "--ram" => {
                 if let Some(a) = args.next() {
                     args_struct.max_ram = match parse_ram_arg(&a) {
                         Ok(ram) => ram,
                         Err(e) => return Err(e),
                     }
                 } else {
-                    return Err("unspecified value for -r/--max_ram".to_string());
+                    return Err("unspecified value for -r/--ram".to_string());
                 }
             }
             "-n" | "--num_workers" => {
