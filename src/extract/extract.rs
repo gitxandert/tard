@@ -7,61 +7,72 @@ use crate::cli::Args;
 
 pub fn extract(args: Args) -> io::Result<()> {
     // validate args
-    let input = match args.input_dir() {
-        Some(f) => f,
+    let input = match args.input_dir {
+        Some(inp) => inp,
         None => return Err(io::Error::new(io::ErrorKind::InvalidInput, "no input directory provided")),
-    };
-    let out_path = match args.output_dir() {
-        Some(dir) => dir,
-        None => return Err(io::Error::new(io::ErrorKind::InvalidInput, "no output directory provided")),
     };
     match input.extension() {
         Some(ext) => {
             match ext.to_str() {
                 Some("tard") => (),
-                _ => {
-                    println!("Err: input for -x must be a .tard file");
-                    std::process::exit(1);
+                _ => return Err(io::Error::new(io::ErrorKind::InvalidInput, "input to tard -x must be .tard file")),
+            }
+        }
+        None => return Err(io::Error::new(io::ErrorKind::InvalidInput, "input to tard -x must be .tard file")),
+    }
+    let out_path = match args.output_dir {
+        Some(oup) => oup,
+        None => return Err(io::Error::new(io::ErrorKind::InvalidInput, "no output directory provided")),
+    };
+
+    let resume = args.resume;
+
+    let (pckg_tx, pckg_rx) = crossbeam_channel::unbounded::<Package>();
+    let pckg_thread = std::thread::spawn(move || -> io::Result<()> {
+        let in_file = File::open(input)?;
+        let mut reader = BufReader::new(in_file);
+        loop {
+            let path = match parse_path(&mut reader) {
+                Ok(p) => p,
+                Err(e) => {
+                    if e.kind() == io::ErrorKind::UnexpectedEof { return Ok(()); }
+                    return Err(e);
+                }
+            };
+            
+            let content = match parse_content(&mut reader) {
+                Ok(c) => c,
+                Err(e) => {
+                    if e.kind() == io::ErrorKind::UnexpectedEof { return Ok(()); }
+                    return Err(e);
+                }
+            };
+
+            let dest = out_path.join(&path);
+            if resume {
+                if dest.exists() { 
+                    println!("Skipping {}...", dest.display());
+                    continue; 
                 }
             }
+
+            let _ = pckg_tx.send(Package::new(dest, content));
         }
-        None => {
-            println!("Err: input for -x must be a .tard file");
-            std::process::exit(1);
-        }
-    }
+    });
 
-    let in_file = File::open(input)?;
-    let mut reader = BufReader::new(in_file);
+    let mut created_dirs = std::collections::HashSet::<PathBuf>::new();
 
-    let mut created_dirs: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
-
-    loop {
-        let path = match parse_path(&mut reader) {
-            Ok(p) => p,
-            Err(e) => {
-                if e.kind() == io::ErrorKind::UnexpectedEof { break; }
-                return Err(e);
-            }
-        };
-        
-        let content = match parse_content(&mut reader) {
-            Ok(c) => c,
-            Err(e) => {
-                if e.kind() == io::ErrorKind::UnexpectedEof { break; }
-                return Err(e);
-            }
-        };
-
-        let dest = out_path.join(&path);
-        let parent = dest.parent().unwrap().to_path_buf();
+    for pckg in pckg_rx {
+        let parent = pckg.dest.parent().unwrap().to_path_buf();
         if !created_dirs.contains(&parent) {
             fs::create_dir_all(&parent)?;
             created_dirs.insert(parent);
         }
-        println!("{}", dest.display());
-        fs::write(&dest, &content)?;
+        println!("{}", pckg.dest.display());
+        fs::write(&pckg.dest, &pckg.content)?;
     }
+
+    let _ = pckg_thread.join();
 
     Ok(())
 }
@@ -88,4 +99,15 @@ fn get_payload(reader: &mut BufReader<File>) -> io::Result<Vec<u8>> {
     reader.read_exact(&mut payload)?;
 
     Ok(payload)
+}
+
+struct Package {
+    dest: PathBuf,
+    content: Vec<u8>,
+}
+
+impl Package {
+    fn new(dest: PathBuf, content: Vec<u8>) -> Self {
+        Self { dest, content }
+    }
 }
