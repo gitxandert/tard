@@ -1,29 +1,41 @@
-use std::{
-    io,
-    path::{Path, PathBuf},
-    os::unix::ffi::{OsStrExt, OsStringExt},
-    thread::{self, JoinHandle},
-    fs::{self, File, OpenOptions},
-};
+use crate::archive_path::{decode_archive_path, write_archive_path};
 use crate::cli::Args;
 use crate::utils::formatting::format_size;
+use std::{
+    collections::HashSet,
+    fs::{self, File, OpenOptions},
+    io,
+    path::{Path, PathBuf},
+    thread::{self, JoinHandle},
+};
 
 pub fn archive(args: Args) -> io::Result<()> {
     println!("Archiving...");
     // validate args
     let input_dir = match args.input_dir {
         Some(ref dir) => dir.clone(),
-        None => return Err(io::Error::new(io::ErrorKind::InvalidInput, "no input directory provided")),
+        None => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "no input directory provided",
+            ))
+        }
     };
     let root = args.input_dir().unwrap();
     let output_dir = match args.output_dir() {
         Some(dir) => dir,
-        None => return Err(io::Error::new(io::ErrorKind::InvalidInput, "no output directory provided")),
+        None => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "no output directory provided",
+            ))
+        }
     };
     // create file to write to
     let out_path = {
-        let dir_name = root.file_name()
-                        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid directory"))?;
+        let dir_name = root
+            .file_name()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid directory"))?;
         let mut p = output_dir.join(&dir_name);
         p.set_extension("tard");
         p
@@ -36,8 +48,9 @@ pub fn archive(args: Args) -> io::Result<()> {
         .open(&out_path)?;
 
     // get root parent for formatting paths
-    let root_parent = root.parent()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "root has no parent"))?;
+    let root_parent = root
+        .parent()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "root has no parent"))?;
 
     let num_workers = args.num_workers;
     let num_buffers = num_workers * 4;
@@ -51,7 +64,7 @@ pub fn archive(args: Args) -> io::Result<()> {
 
     // build ExistingPaths before spawning so out_file stays on main thread
     let mut existing_paths = if args.resume {
-        Some(ExistingPaths::new(&mut out_file, root_parent))
+        Some(ExistingPaths::new(&mut out_file, root_parent)?)
     } else {
         None
     };
@@ -110,9 +123,9 @@ pub fn archive(args: Args) -> io::Result<()> {
     // final flush
     write_buffer.flush()?;
 
-    let _ = path_collector.join().expect("Path collector panicked");
+    path_collector.join().expect("Path collector panicked")?;
     for handle in handles {
-        let _ = handle.join().expect("Worker thread panicked");
+        handle.join().expect("Worker thread panicked")?;
     }
 
     println!("Finished writing to {}", out_path.display());
@@ -148,24 +161,34 @@ fn spawn_archive_thread(
                 }
             };
 
-            let path_rel = path.strip_prefix(&root_parent).unwrap();
-            let path_bytes = path_rel.as_os_str().as_bytes();
-            let path_len = path_bytes.len() as u64;
-            for i in 0..8 {
-                buf.push((path_len >> (8 * i)) as u8);
-            }
-            buf.extend_from_slice(path_bytes);
+            let path_rel = path.strip_prefix(&root_parent).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("{} is not inside {}", path.display(), root_parent.display()),
+                )
+            })?;
+            write_archive_path(&mut buf, path_rel).map_err(|e| {
+                io::Error::new(
+                    e.kind(),
+                    format!("could not encode archive path {}: {}", path.display(), e),
+                )
+            })?;
 
             let file_len = path_data.len;
-            for i in 0..8 {
-                buf.push((file_len >> (8 * i)) as u8);
-            }
+            buf.extend_from_slice(&file_len.to_le_bytes());
 
-            println!("Thread {} opened {} ({})", thread_id, path.display(), format_size(file_len));
+            println!(
+                "Thread {} opened {} ({})",
+                thread_id,
+                path.display(),
+                format_size(file_len)
+            );
 
             if file_len > chunk_size {
                 // send the entire file to the write thread
-                write_tx.send(Package::new(buf, path, PackageType::File(file, file_len))).unwrap();
+                write_tx
+                    .send(Package::new(buf, path, PackageType::File(file, file_len)))
+                    .unwrap();
             } else {
                 match file.by_ref().take(file_len).read_to_end(&mut buf) {
                     Ok(_) => (),
@@ -176,7 +199,9 @@ fn spawn_archive_thread(
                         continue;
                     }
                 }
-                write_tx.send(Package::new(buf, path, PackageType::Chunk)).unwrap();
+                write_tx
+                    .send(Package::new(buf, path, PackageType::Chunk))
+                    .unwrap();
             }
         }
 
@@ -210,17 +235,13 @@ fn recurse_dir(
                 }
                 let len = metadata.len();
                 if path_rx.send(PathData::new(path_buf, len)).is_err() {
-                    return Ok(());  // channel is closed
+                    return Ok(()); // channel is closed
                 }
             } else if metadata.is_dir() {
                 match recurse_dir(&path_buf, path_rx.clone(), existing.as_deref_mut()) {
                     Ok(_) => (),
                     Err(e) => {
-                        eprintln!(
-                            "Err -- could not recurse {}: {}",
-                            path_buf.display(),
-                            e
-                        );
+                        eprintln!("Err -- could not recurse {}: {}", path_buf.display(), e);
                     }
                 }
             }
@@ -234,17 +255,18 @@ fn recurse_dir(
 //
 
 struct ExistingPaths {
-    paths: Vec<PathBuf>,
+    paths: HashSet<PathBuf>,
 }
 
 impl ExistingPaths {
-    fn new(out_file: &mut File, root_parent: &Path) -> Self {
+    fn new(out_file: &mut File, root_parent: &Path) -> io::Result<Self> {
         use std::io::{Read, Seek, SeekFrom};
 
         let _ = out_file.seek(SeekFrom::Start(0));
         let mut reader = std::io::BufReader::new(&mut *out_file);
-        let mut paths: Vec<PathBuf> = Vec::new();
+        let mut paths: HashSet<PathBuf> = HashSet::new();
         let mut last_header_pos: u64 = 0;
+        let mut last_path: Option<PathBuf> = None;
 
         loop {
             let pos = match reader.stream_position() {
@@ -276,29 +298,27 @@ impl ExistingPaths {
                 break;
             }
 
-            let rel_path = PathBuf::from(std::ffi::OsString::from_vec(path_bytes));
-            paths.push(root_parent.join(rel_path));
+            let rel_path = decode_archive_path(&path_bytes)?;
+            let path = root_parent.join(rel_path);
+            paths.insert(path.clone());
+            last_path = Some(path);
             last_header_pos = pos;
         }
 
+        drop(reader);
+
         // remove last path and truncate file to erase its header + content
-        if !paths.is_empty() {
-            paths.pop();
+        if let Some(path) = last_path {
+            paths.remove(&path);
             let _ = out_file.set_len(last_header_pos);
             let _ = out_file.seek(SeekFrom::End(0));
         }
 
-        Self { paths }
+        Ok(Self { paths })
     }
 
     fn check(&mut self, path: &Path) -> bool {
-        for i in 0..self.paths.len() {
-            if path == self.paths[i] {
-                let _ = self.paths.remove(i);
-                return true;
-            }
-        }
-        return false;
+        self.paths.remove(path)
     }
 }
 
@@ -326,7 +346,11 @@ struct Package {
 
 impl Package {
     fn new(data: Vec<u8>, path: PathBuf, package_type: PackageType) -> Self {
-        Self { data, path, package_type }
+        Self {
+            data,
+            path,
+            package_type,
+        }
     }
 }
 
@@ -339,11 +363,7 @@ struct TardWriter {
 }
 
 impl TardWriter {
-    fn new(
-        out_file: File,
-        capacity: usize,
-        buf_tx: crossbeam_channel::Sender<Vec<u8>>,
-    ) -> Self {
+    fn new(out_file: File, capacity: usize, buf_tx: crossbeam_channel::Sender<Vec<u8>>) -> Self {
         Self {
             out_file,
             buf: Vec::with_capacity(capacity),
@@ -381,17 +401,21 @@ impl TardWriter {
 
     fn flush_package_file(&mut self, package: Package) -> io::Result<()> {
         use std::io::Read;
-        
+
         self.flush_package_buffer(&package.path, package.data)?;
-        let PackageType::File(mut file, mut file_len) = package.package_type else { 
-            return Ok(()); 
+        let PackageType::File(mut file, mut file_len) = package.package_type else {
+            return Ok(());
         };
         let mut take = file_len.min(self.space_left() as u64);
         file_len -= take;
         match file.by_ref().take(take).read_to_end(&mut self.buf) {
             Ok(_) => (),
             Err(e) => {
-                println!("Err -- problem reading from {}: {}", package.path.display(), e);
+                println!(
+                    "Err -- problem reading from {}: {}",
+                    package.path.display(),
+                    e
+                );
                 return Ok(());
             }
         }
@@ -404,7 +428,11 @@ impl TardWriter {
             match file.by_ref().take(take).read_to_end(&mut self.buf) {
                 Ok(_) => (),
                 Err(e) => {
-                    println!("Err -- problem reading from {}: {}", package.path.display(), e);
+                    println!(
+                        "Err -- problem reading from {}: {}",
+                        package.path.display(),
+                        e
+                    );
                     return Ok(());
                 }
             }
@@ -416,12 +444,8 @@ impl TardWriter {
 
     fn write_package(&mut self, package: Package) -> io::Result<()> {
         match package.package_type {
-            PackageType::Chunk => {
-                self.flush_package_buffer(&package.path, package.data)
-            }
-            PackageType::File(_, _) => {
-                self.flush_package_file(package)
-            }
+            PackageType::Chunk => self.flush_package_buffer(&package.path, package.data),
+            PackageType::File(_, _) => self.flush_package_file(package),
         }
     }
 

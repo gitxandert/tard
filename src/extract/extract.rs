@@ -1,28 +1,47 @@
+use crate::archive_path::decode_archive_path;
+use crate::cli::Args;
 use std::{
     fs::{self, File},
-    path::{Path, PathBuf},
     io::{self, BufReader, Read},
+    path::PathBuf,
 };
-use crate::cli::Args;
 
 pub fn extract(args: Args) -> io::Result<()> {
     // validate args
     let input = match args.input_dir {
         Some(inp) => inp,
-        None => return Err(io::Error::new(io::ErrorKind::InvalidInput, "no input directory provided")),
+        None => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "no input directory provided",
+            ))
+        }
     };
     match input.extension() {
-        Some(ext) => {
-            match ext.to_str() {
-                Some("tard") => (),
-                _ => return Err(io::Error::new(io::ErrorKind::InvalidInput, "input to tard -x must be .tard file")),
+        Some(ext) => match ext.to_str() {
+            Some("tard") => (),
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "input to tard -x must be .tard file",
+                ))
             }
+        },
+        None => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "input to tard -x must be .tard file",
+            ))
         }
-        None => return Err(io::Error::new(io::ErrorKind::InvalidInput, "input to tard -x must be .tard file")),
     }
     let out_path = match args.output_dir {
         Some(oup) => oup,
-        None => return Err(io::Error::new(io::ErrorKind::InvalidInput, "no output directory provided")),
+        None => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "no output directory provided",
+            ))
+        }
     };
 
     let resume = args.resume;
@@ -35,24 +54,28 @@ pub fn extract(args: Args) -> io::Result<()> {
             let path = match parse_path(&mut reader) {
                 Ok(p) => p,
                 Err(e) => {
-                    if e.kind() == io::ErrorKind::UnexpectedEof { return Ok(()); }
+                    if e.kind() == io::ErrorKind::UnexpectedEof {
+                        return Ok(());
+                    }
                     return Err(e);
                 }
             };
-            
+
             let content = match parse_content(&mut reader) {
                 Ok(c) => c,
                 Err(e) => {
-                    if e.kind() == io::ErrorKind::UnexpectedEof { return Ok(()); }
+                    if e.kind() == io::ErrorKind::UnexpectedEof {
+                        return Ok(());
+                    }
                     return Err(e);
                 }
             };
 
             let dest = out_path.join(&path);
             if resume {
-                if dest.exists() { 
+                if dest.exists() {
                     println!("Skipping {}...", dest.display());
-                    continue; 
+                    continue;
                 }
             }
 
@@ -72,7 +95,7 @@ pub fn extract(args: Args) -> io::Result<()> {
         fs::write(&pckg.dest, &pckg.content)?;
     }
 
-    let _ = pckg_thread.join();
+    pckg_thread.join().expect("Package parser panicked")?;
 
     Ok(())
 }
@@ -80,10 +103,7 @@ pub fn extract(args: Args) -> io::Result<()> {
 fn parse_path(reader: &mut BufReader<File>) -> io::Result<PathBuf> {
     let path_payload = get_payload(reader)?;
 
-    let path_string = String::from_utf8(path_payload)
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid UTF-8"))?;
-
-    Ok(PathBuf::from(Path::new(&path_string)))
+    decode_archive_path(&path_payload)
 }
 
 fn parse_content(reader: &mut BufReader<File>) -> io::Result<Vec<u8>> {
