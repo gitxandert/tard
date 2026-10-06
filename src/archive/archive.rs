@@ -37,7 +37,7 @@ pub fn archive(args: Args) -> io::Result<()> {
             .file_name()
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid directory"))?;
         let mut p = output_dir.join(&dir_name);
-        p.set_extension("tard");
+        p.as_mut_os_string().push(".tard");
         p
     };
     let mut out_file = OpenOptions::new()
