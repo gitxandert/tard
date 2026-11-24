@@ -12,8 +12,7 @@ use crate::utils::formatting::format_size;
 use crate::utils::logger::{LogEntry, LogMsg, LogTx, Logger};
 
 pub fn archive(args: Args) -> io::Result<()> {
-    println!("Archiving...");
-    // validate args
+    // validate args (errors here are returned: the logger doesn't exist yet)
     let input_dir = match args.input_dir {
         Some(ref dir) => dir.clone(),
         None => return Err(io::Error::new(io::ErrorKind::InvalidInput, "no input directory provided")),
@@ -25,22 +24,36 @@ pub fn archive(args: Args) -> io::Result<()> {
     };
     let dir_name = root.file_name()
                     .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid directory"))?;
-    // create file to write to
     let out_path = {
         let mut p = output_dir.join(&dir_name);
         p.set_extension("tard");
         p
     };
-    let mut out_file = OpenOptions::new()
+    // get root parent for formatting paths
+    let root_parent = root.parent()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "root has no parent"))?;
+
+    // logger destinations are fixed here, before any worker exists.
+    // From here on, all output goes through it.
+    let logger = Logger::spawn(
+        args.verbose,
+        output_dir,
+        &dir_name.to_string_lossy(),
+        PathBuf::from(root_parent),
+    )?;
+    let _ = logger.tx.send(LogMsg::Info(format!("Archiving {} to {}...", root.display(), out_path.display())));
+
+    // create file to write to
+    let mut out_file = match OpenOptions::new()
         .read(args.resume)
         .write(true)
         .append(args.resume)
         .create(true)
-        .open(&out_path)?;
-
-    // get root parent for formatting paths
-    let root_parent = root.parent()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "root has no parent"))?;
+        .open(&out_path)
+    {
+        Ok(f) => f,
+        Err(e) => logger.fatal(format!("Err -- could not open {}: {}", out_path.display(), e)),
+    };
 
     let num_workers = args.num_workers;
     let num_buffers = num_workers * 4;
@@ -52,32 +65,27 @@ pub fn archive(args: Args) -> io::Result<()> {
     let (buf_tx, buf_rx) = crossbeam_channel::unbounded::<Vec<u8>>();
     let (write_tx, write_rx) = crossbeam_channel::unbounded::<Package>();
 
-    // logger destination is fixed here, before any worker exists
-    let logger = Logger::spawn(
-        args.verbose,
-        output_dir,
-        &dir_name.to_string_lossy(),
-        PathBuf::from(root_parent),
-    )?;
-
     // build ExistingPaths before spawning so out_file stays on main thread
     let mut existing_paths = if args.resume {
-        Some(ExistingPaths::new(&mut out_file, root_parent))
+        let ex = ExistingPaths::new(&mut out_file, root_parent);
+        let _ = logger.tx.send(LogMsg::Note(format!(
+            "Resuming: {} files already in {}", ex.paths.len(), out_path.display()
+        )));
+        Some(ex)
     } else {
         None
     };
 
-    if let Some(ref paths) = existing_paths {
-        println!("Found {} encoded paths", paths.paths.len());
-    }
-
     // separate thread for collecting paths
     let collector_log = logger.tx.clone();
     let path_collector = thread::spawn(move || -> io::Result<()> {
-        recurse_dir(&input_dir, path_tx, existing_paths.as_mut(), &collector_log)
+        let r = recurse_dir(&input_dir, path_tx, existing_paths.as_mut(), &collector_log);
+        if let Some(ex) = existing_paths {
+            let _ = collector_log.send(LogMsg::Note(format!("Skipped {} files already archived", ex.skipped)));
+        }
+        r
     });
 
-    println!("Allocating {}...", format_size(total_size as u64));
     // Arena allocation: one block carved into num_buffers chunks for regular workers.
     let mut massive_block = Vec::with_capacity(ram_split);
     massive_block.resize(ram_split, 0u8);
@@ -88,6 +96,10 @@ pub fn archive(args: Args) -> io::Result<()> {
         buf.clear();
         buf_tx.send(buf).unwrap();
     }
+    let _ = logger.tx.send(LogMsg::Note(format!(
+        "Allocated {} ({} worker buffers of {} + {} write buffer)",
+        format_size(total_size as u64), num_buffers, format_size(chunk_size as u64), format_size(ram_split as u64),
+    )));
 
     let mut handles = Vec::<JoinHandle<io::Result<()>>>::with_capacity(num_workers);
     for _ in 0..num_workers {
@@ -106,19 +118,19 @@ pub fn archive(args: Args) -> io::Result<()> {
     drop(buf_rx);
     drop(write_tx);
 
-    let mut write_buffer = TardWriter::new(out_file, ram_split, buf_tx, logger.tx.clone());
+    let mut write_buffer = TardWriter::new(
+        out_file, ram_split, buf_tx, logger.tx.clone(), out_path.display().to_string(),
+    );
 
     for package in write_rx {
-        match write_buffer.write_package(package) {
-            Ok(()) => continue,
-            Err(e) => {
-                eprintln!("Err -- I/O: {}", e);
-                std::process::exit(1);
-            }
+        if let Err(e) = write_buffer.write_package(package) {
+            logger.fatal(format!("Err -- could not write {}: {}", out_path.display(), e));
         }
     }
     // final flush
-    write_buffer.flush()?;
+    if let Err(e) = write_buffer.flush() {
+        logger.fatal(format!("Err -- could not write {}: {}", out_path.display(), e));
+    }
 
     let _ = path_collector.join().expect("Path collector panicked");
     for handle in handles {
@@ -126,9 +138,10 @@ pub fn archive(args: Args) -> io::Result<()> {
     }
     drop(write_buffer);
 
-    let log_path = logger.finish()?;
-    println!("Finished writing to {}", out_path.display());
-    println!("Log written to {}", log_path.display());
+    let log_path = logger.log_path.clone();
+    let _ = logger.tx.send(LogMsg::Note(format!("Log written to {}", log_path.display())));
+    let _ = logger.tx.send(LogMsg::Info(format!("Finished archiving {} to {}", root.display(), out_path.display())));
+    logger.finish();
 
     Ok(())
 }
@@ -213,7 +226,6 @@ fn recurse_dir(
             if metadata.is_file() {
                 if let Some(ref mut ex) = existing {
                     if ex.check(&path_buf) {
-                        let _ = log_tx.send(LogMsg::Note(format!("Skipping encoded file {}", path_buf.display())));
                         continue;
                     }
                 }
@@ -246,6 +258,7 @@ fn recurse_dir(
 
 struct ExistingPaths {
     paths: HashSet<PathBuf>,
+    skipped: usize,
 }
 
 impl ExistingPaths {
@@ -299,12 +312,14 @@ impl ExistingPaths {
             let _ = out_file.seek(SeekFrom::End(0));
         }
 
-        Self { paths: paths.into_iter().collect() }
+        Self { paths: paths.into_iter().collect(), skipped: 0 }
     }
 
     // O(1) instead of a linear scan per file
     fn check(&mut self, path: &Path) -> bool {
-        self.paths.remove(path)
+        let found = self.paths.remove(path);
+        self.skipped += found as usize;
+        found
     }
 }
 
@@ -336,6 +351,7 @@ struct TardWriter {
     buf: Vec<u8>,
     buf_tx: crossbeam_channel::Sender<Vec<u8>>, // recycles File package buffers
     log_tx: LogTx,
+    out_name: String, // for "Flushed" notes
     capacity: usize,
 }
 
@@ -345,12 +361,14 @@ impl TardWriter {
         capacity: usize,
         buf_tx: crossbeam_channel::Sender<Vec<u8>>,
         log_tx: LogTx,
+        out_name: String,
     ) -> Self {
         Self {
             out_file,
             buf: Vec::with_capacity(capacity),
             buf_tx,
             log_tx,
+            out_name,
             capacity,
         }
     }
@@ -428,6 +446,14 @@ impl TardWriter {
 
     fn flush(&mut self) -> io::Result<()> {
         use std::io::Write;
-        self.out_file.write_all(&self.buf)
+        if self.buf.is_empty() {
+            return Ok(());
+        }
+        self.out_file.write_all(&self.buf)?;
+        // once per full write buffer (max_ram / 2), so the format is negligible
+        let _ = self.log_tx.send(LogMsg::Note(format!(
+            "Flushed {} to {}", format_size(self.buf.len() as u64), self.out_name
+        )));
+        Ok(())
     }
 }

@@ -10,8 +10,8 @@ pub fn route_args() {
     let args = match parse_args() {
         Ok(a) => a,
         Err(e) => {
-            println!("Error while parsing args: {}", e);
-            return;
+            eprintln!("Error while parsing args: {}", e);
+            std::process::exit(2);
         }
     };
 
@@ -19,13 +19,19 @@ pub fn route_args() {
         Cmd::Archive => {
             match archive(args) {
                 Ok(()) => (),
-                Err(e) => println!("Error while archiving: {}", e),
+                Err(e) => {
+                    eprintln!("Error while archiving: {}", e);
+                    std::process::exit(1);
+                }
             }
         }
         Cmd::Extract => {
             match extract(args) {
                 Ok(()) => (),
-                Err(e) => println!("Error while extracting: {}", e),
+                Err(e) => {
+                    eprintln!("Error while extracting: {}", e);
+                    std::process::exit(1);
+                }
             }
         }
         Cmd::Help => print_help(),
@@ -112,8 +118,9 @@ Options:
   -c, --continue             Resume an interrupted run (default: {})
   -r, --ram <SIZE>           Max RAM for buffers, e.g. 512KB, 64MB, 1GB (default: {})
   -n, --num_workers <N>      Number of worker threads (default: {})
-  -v, --verbose              Also print the per-file log to stdout; it is always
-                             written to <OUTPUT_DIR>/<name>_<datetime>.log (default: {})
+  -v, --verbose              Also print each file's path and size, plus progress
+                             notes. A CSV log is always written to
+                             <OUTPUT_DIR>/<name>_<datetime>.log (default: {})
   -h, --help                 Show this help",
         d.resume,
         format_size(d.max_ram as u64),

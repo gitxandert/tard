@@ -19,11 +19,16 @@ pub struct LogEntry {
 }
 
 pub enum LogMsg {
+    /// CSV row in the log file; "<path> (<size>)" on stdout with -v
     Entry(LogEntry),
-    /// informational; only shown with -v/--verbose
+    /// always shown on stdout (start/finish lines)
+    Info(String),
+    /// shown on stdout only with -v
     Note(String),
-    /// always shown, on stderr
+    /// always shown, on stderr (errors and warnings)
     Error(String),
+    /// shown on stderr, then the logger flushes everything and exits the process
+    Fatal(String),
 }
 
 pub type LogTx = Sender<LogMsg>;
@@ -41,7 +46,10 @@ impl Logger {
     pub fn spawn(verbose: bool, log_dir: &Path, dest_name: &str, strip_root: PathBuf) -> io::Result<Self> {
         let (tx, rx) = crossbeam_channel::unbounded::<LogMsg>();
         let log_path = log_dir.join(format!("{}_{}.log", dest_name, format_filename_time(SystemTime::now())));
-        let file = BufWriter::with_capacity(1 << 16, File::create(&log_path)?);
+        let file = File::create(&log_path).map_err(|e| {
+            io::Error::new(e.kind(), format!("could not create log {}: {}", log_path.display(), e))
+        })?;
+        let file = BufWriter::with_capacity(1 << 16, file);
         // not stdout().lock(): holding the lock would deadlock main-thread println!s
         let out = BufWriter::new(io::stdout());
         let handle = if verbose {
@@ -54,23 +62,46 @@ impl Logger {
 
     /// Drops this sender and waits for the logger to drain. Every other `LogTx`
     /// clone must already be dropped, or this blocks.
-    pub fn finish(self) -> io::Result<PathBuf> {
+    pub fn finish(self) {
         drop(self.tx);
-        self.handle.join().expect("Logger thread panicked")?;
-        Ok(self.log_path)
+        // a logger I/O failure was already reported on stderr by the logger itself
+        let _ = self.handle.join().expect("Logger thread panicked");
+    }
+
+    /// Reports `msg` through the logger, which flushes and exits with status 1.
+    /// For unrecoverable errors while workers still hold senders.
+    pub fn fatal(&self, msg: String) -> ! {
+        if let Err(e) = self.tx.send(LogMsg::Fatal(msg)) {
+            // logger already gone: nothing else can print this
+            let LogMsg::Fatal(m) = e.into_inner() else { unreachable!() };
+            eprintln!("{}", m);
+            std::process::exit(1);
+        }
+        loop { thread::park(); }
     }
 }
 
-// VERBOSE is a compile-time choice, so the logger has no runtime branch on it either.
 fn run<const VERBOSE: bool>(
+    file: BufWriter<File>,
+    out: BufWriter<io::Stdout>,
+    rx: Receiver<LogMsg>,
+    strip_root: &Path,
+) -> io::Result<()> {
+    let r = drain::<VERBOSE>(file, out, rx, strip_root);
+    if let Err(ref e) = r {
+        eprintln!("Err -- could not write log: {}", e);
+    }
+    r
+}
+
+// VERBOSE is a compile-time choice, so the logger has no runtime branch on it either.
+fn drain<const VERBOSE: bool>(
     mut file: BufWriter<File>,
     mut out: BufWriter<io::Stdout>,
     rx: Receiver<LogMsg>,
     strip_root: &Path,
 ) -> io::Result<()> {
     file.write_all(CSV_HEADER.as_bytes())?;
-    if VERBOSE { out.write_all(CSV_HEADER.as_bytes())?; }
-    // each row is formatted once into `line`, then copied to every destination
     let mut line = Vec::<u8>::with_capacity(256);
     // Drain on a timer instead of blocking in recv(): a parked receiver makes every
     // send() pay for a futex wake, which showed up as ~0.3s of extra CPU per 20k files.
@@ -79,29 +110,38 @@ fn run<const VERBOSE: bool>(
         loop {
             match rx.try_recv() {
                 Ok(LogMsg::Entry(e)) => {
+                    let rel = e.path.strip_prefix(strip_root).unwrap_or(&e.path);
                     line.clear();
-                    write_entry(&mut line, &e, strip_root)?;
+                    write_csv_row(&mut line, rel, &e)?;
                     file.write_all(&line)?;
-                    if VERBOSE { out.write_all(&line)?; }
+                    if VERBOSE { writeln!(out, "{} ({})", rel.display(), format_size(e.size))?; }
                 }
-                // notes are stdout-only so the log file stays pure CSV
+                Ok(LogMsg::Info(s)) => writeln!(out, "{}", s)?,
                 Ok(LogMsg::Note(s)) => if VERBOSE { writeln!(out, "{}", s)?; },
-                Ok(LogMsg::Error(s)) => eprintln!("{}", s),
+                Ok(LogMsg::Error(s)) => {
+                    out.flush()?; // keep stdout/stderr in order
+                    eprintln!("{}", s);
+                }
+                Ok(LogMsg::Fatal(s)) => {
+                    out.flush()?;
+                    file.flush()?;
+                    eprintln!("{}", s);
+                    std::process::exit(1);
+                }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
-                    if VERBOSE { out.flush()?; }
+                    out.flush()?;
                     return file.flush();
                 }
             }
         }
-        // stdout: flush each round so output stays live. file: keep batching.
-        if VERBOSE { out.flush()?; }
+        // stdout: flush each round so output stays live (no-op when empty). file: keep batching.
+        out.flush()?;
         thread::sleep(DRAIN_INTERVAL);
     }
 }
 
-fn write_entry<W: Write>(w: &mut W, e: &LogEntry, strip_root: &Path) -> io::Result<()> {
-    let rel = e.path.strip_prefix(strip_root).unwrap_or(&e.path);
+fn write_csv_row<W: Write>(w: &mut W, rel: &Path, e: &LogEntry) -> io::Result<()> {
     let name = rel.file_name().map(|n| n.to_string_lossy()).unwrap_or_default();
     let dir = rel.parent().map(|p| p.to_string_lossy()).unwrap_or_default();
     write_csv_field(w, &name)?;
