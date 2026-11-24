@@ -4,6 +4,7 @@ use std::{
 };
 use crate::archive::archive::archive;
 use crate::extract::extract::extract;
+use crate::utils::formatting::format_size;
 
 pub fn route_args() {
     let args = match parse_args() {
@@ -27,6 +28,7 @@ pub fn route_args() {
                 Err(e) => println!("Error while extracting: {}", e),
             }
         }
+        Cmd::Help => print_help(),
     }
 }
 
@@ -38,6 +40,10 @@ fn parse_args() -> Result<Args, String> {
     let mut args_struct = Args::new();
     while let Some(a) = args.next() {
         match a.as_str() {
+            "-h" | "--help" => {
+                args_struct.cmd = Cmd::Help;
+                return Ok(args_struct);
+            }
             "-a" | "--archive" => args_struct.cmd = Cmd::Archive,
             "-x" | "--extract" => args_struct.cmd = Cmd::Extract,
             "-c" | "--continue"  => args_struct.resume = true,
@@ -58,7 +64,7 @@ fn parse_args() -> Result<Args, String> {
                         Err(e) => return Err(e.to_string()),
                     }
                 } else {
-                    return Err("unspecified value for -w/--num_workers".to_string());
+                    return Err("unspecified value for -n/--num_workers".to_string());
                 }
             }
             _ => {
@@ -92,6 +98,26 @@ fn parse_args() -> Result<Args, String> {
     Ok(args_struct)
 }
 
+fn print_help() {
+    let d = Args::new();
+    println!(
+"Usage: tard [OPTIONS] <INPUT> <OUTPUT_DIR>
+
+Archive a directory into <OUTPUT_DIR>/<name>.tard, or extract a .tard file.
+
+Options:
+  -a, --archive              Archive INPUT directory (default)
+  -x, --extract              Extract INPUT .tard file
+  -c, --continue             Resume an interrupted run (default: {})
+  -r, --ram <SIZE>           Max RAM for buffers, e.g. 512KB, 64MB, 1GB (default: {})
+  -n, --num_workers <N>      Number of worker threads (default: {})
+  -h, --help                 Show this help",
+        d.resume,
+        format_size(d.max_ram as u64),
+        d.num_workers,
+    );
+}
+
 fn parse_ram_arg(ram: &str) -> Result<usize, String> {
     let suffixes = [
         ("TB", 1usize << 40),
@@ -121,6 +147,7 @@ fn parse_ram_arg(ram: &str) -> Result<usize, String> {
 enum Cmd {
     Archive,
     Extract,
+    Help,
 }
 
 pub struct Args {
