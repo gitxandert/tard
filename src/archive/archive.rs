@@ -155,8 +155,6 @@ fn spawn_archive_thread(
     root_parent: PathBuf,
     chunk_size: u64,
 ) -> JoinHandle<io::Result<()>> {
-    use std::io::Read;
-
     thread::spawn(move || -> io::Result<()> {
         for path_data in path_rx {
             let mut buf = match buf_rx.recv() {
@@ -187,22 +185,43 @@ fn spawn_archive_thread(
                 let _ = log_tx.send(LogMsg::Entry(LogEntry { path: path.clone(), size: file_len, mtime }));
                 write_tx.send(Package::new(buf, PackageType::File(file, file_len, path))).unwrap();
             } else {
-                match file.by_ref().take(file_len).read_to_end(&mut buf) {
-                    Ok(_) => (),
+                let size = match read_chunk(&mut file, file_len, &mut buf) {
+                    Ok(n) => n,
                     Err(e) => {
                         let _ = log_tx.send(LogMsg::Error(format!("Err -- problem reading from {}: {}", path.display(), e)));
                         buf.clear();
                         buf_tx.send(buf).unwrap();
                         continue;
                     }
+                };
+                if size != file_len {
+                    let _ = log_tx.send(LogMsg::Error(format!(
+                        "Warning -- {} shrank while archiving; stored {} of {} bytes",
+                        path.display(), size, file_len,
+                    )));
                 }
                 write_tx.send(Package::new(buf, PackageType::Chunk)).unwrap();
-                let _ = log_tx.send(LogMsg::Entry(LogEntry { path, size: file_len, mtime }));
+                let _ = log_tx.send(LogMsg::Entry(LogEntry { path, size, mtime }));
             }
         }
 
         Ok(())
     })
+}
+
+/// Appends up to `file_len` bytes of `file` to `buf`, whose last 8 bytes must be the
+/// content-length header. If the file turned out shorter (it shrank after it was
+/// stat'ed), the header is rewritten to the bytes actually read so the archive stays
+/// parseable. Returns the stored length.
+fn read_chunk(file: &mut File, file_len: u64, buf: &mut Vec<u8>) -> io::Result<u64> {
+    use std::io::Read;
+    let start = buf.len();
+    file.take(file_len).read_to_end(buf)?;
+    let n = (buf.len() - start) as u64;
+    if n != file_len {
+        buf[start - 8..start].copy_from_slice(&n.to_le_bytes());
+    }
+    Ok(n)
 }
 
 fn recurse_dir(
@@ -399,35 +418,51 @@ impl TardWriter {
         Ok(())
     }
 
+    // The header (with file_len) may already be on disk by the time a read comes up
+    // short, so it can't be corrected. Instead the missing bytes are zero-filled, like
+    // tar does, keeping every later entry where the format expects it.
     fn flush_package_file(&mut self, package: Package) -> io::Result<()> {
         use std::io::Read;
-        
+
         self.flush_package_buffer(package.data)?;
-        let PackageType::File(mut file, mut file_len, path) = package.package_type else {
+        let PackageType::File(mut file, file_len, path) = package.package_type else {
             return Ok(());
         };
-        let mut take = file_len.min(self.space_left() as u64);
-        file_len -= take;
-        match file.by_ref().take(take).read_to_end(&mut self.buf) {
-            Ok(_) => (),
-            Err(e) => {
-                let _ = self.log_tx.send(LogMsg::Error(format!("Err -- problem reading from {}: {}", path.display(), e)));
-                return Ok(());
+        let mut remaining = file_len;
+        let mut problem: Option<String> = None;
+        while remaining > 0 {
+            if self.space_left() == 0 {
+                self.flush()?;
+                self.clear();
+            }
+            let take = remaining.min(self.space_left() as u64);
+            let start = self.buf.len();
+            // on error, read_to_end keeps what it read, so count from buf either way
+            let r = file.by_ref().take(take).read_to_end(&mut self.buf);
+            let n = (self.buf.len() - start) as u64;
+            remaining -= n;
+            match r {
+                Err(e) => { problem = Some(e.to_string()); break; }
+                Ok(_) if n < take => { problem = Some("file shrank while archiving".to_string()); break; }
+                Ok(_) => (),
             }
         }
 
-        while file_len > 0 {
-            self.flush()?;
-            self.clear();
-            take = file_len.min(self.space_left() as u64);
-            file_len -= take;
-            match file.by_ref().take(take).read_to_end(&mut self.buf) {
-                Ok(_) => (),
-                Err(e) => {
-                    let _ = self.log_tx.send(LogMsg::Error(format!("Err -- problem reading from {}: {}", path.display(), e)));
-                    return Ok(());
+        if let Some(why) = problem {
+            let missing = remaining;
+            while remaining > 0 {
+                if self.space_left() == 0 {
+                    self.flush()?;
+                    self.clear();
                 }
+                let n = remaining.min(self.space_left() as u64) as usize;
+                self.buf.resize(self.buf.len() + n, 0);
+                remaining -= n as u64;
             }
+            let _ = self.log_tx.send(LogMsg::Error(format!(
+                "Warning -- problem reading from {}: {}; zero-filled the last {} of {}",
+                path.display(), why, format_size(missing), format_size(file_len),
+            )));
         }
 
         Ok(())
@@ -455,5 +490,53 @@ impl TardWriter {
             "Flushed {} to {}", format_size(self.buf.len() as u64), self.out_name
         )));
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Read, Seek, SeekFrom, Write};
+
+    fn temp_file(name: &str, contents: &[u8]) -> (PathBuf, File) {
+        let p = std::env::temp_dir().join(format!("tard_test_{}_{}", std::process::id(), name));
+        let mut f = File::create(&p).unwrap();
+        f.write_all(contents).unwrap();
+        (p.clone(), File::open(&p).unwrap())
+    }
+
+    #[test]
+    fn read_chunk_rewrites_header_when_file_is_short() {
+        let (p, mut f) = temp_file("chunk", b"hello");
+        let mut buf = 100u64.to_le_bytes().to_vec(); // header claims 100 bytes
+        assert_eq!(read_chunk(&mut f, 100, &mut buf).unwrap(), 5);
+        assert_eq!(&buf[..8], &5u64.to_le_bytes());
+        assert_eq!(&buf[8..], b"hello");
+        let _ = fs::remove_file(p);
+    }
+
+    #[test]
+    fn large_file_short_read_is_zero_filled() {
+        let (src, f) = temp_file("large_src", &[7u8; 30]);
+        let out_p = std::env::temp_dir().join(format!("tard_test_{}_large_out", std::process::id()));
+        let out = OpenOptions::new().read(true).write(true).create(true).truncate(true).open(&out_p).unwrap();
+        let (buf_tx, _buf_rx) = crossbeam_channel::unbounded();
+        let (log_tx, log_rx) = crossbeam_channel::unbounded();
+        // capacity 16 forces several flushes mid-file and mid-padding
+        let mut w = TardWriter::new(out, 16, buf_tx, log_tx, String::new());
+        let header = 100u64.to_le_bytes().to_vec(); // claims 100, file has 30
+        w.write_package(Package::new(header, PackageType::File(f, 100, src.clone()))).unwrap();
+        w.flush().unwrap();
+
+        let mut written = Vec::new();
+        let mut out = w.out_file.try_clone().unwrap();
+        out.seek(SeekFrom::Start(0)).unwrap();
+        out.read_to_end(&mut written).unwrap();
+        assert_eq!(written.len(), 8 + 100);
+        assert!(written[8..38].iter().all(|&b| b == 7));
+        assert!(written[38..].iter().all(|&b| b == 0));
+        assert!(log_rx.try_iter().any(|m| matches!(m, LogMsg::Error(s) if s.contains("zero-filled"))));
+        let _ = fs::remove_file(src);
+        let _ = fs::remove_file(out_p);
     }
 }
