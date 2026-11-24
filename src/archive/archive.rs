@@ -4,9 +4,12 @@ use std::{
     os::unix::ffi::{OsStrExt, OsStringExt},
     thread::{self, JoinHandle},
     fs::{self, File, OpenOptions},
+    collections::HashSet,
+    time::{SystemTime, UNIX_EPOCH},
 };
 use crate::cli::Args;
 use crate::utils::formatting::format_size;
+use crate::utils::logger::{LogEntry, LogMsg, LogTx, Logger};
 
 pub fn archive(args: Args) -> io::Result<()> {
     println!("Archiving...");
@@ -20,10 +23,10 @@ pub fn archive(args: Args) -> io::Result<()> {
         Some(dir) => dir,
         None => return Err(io::Error::new(io::ErrorKind::InvalidInput, "no output directory provided")),
     };
+    let dir_name = root.file_name()
+                    .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid directory"))?;
     // create file to write to
     let out_path = {
-        let dir_name = root.file_name()
-                        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid directory"))?;
         let mut p = output_dir.join(&dir_name);
         p.set_extension("tard");
         p
@@ -49,6 +52,14 @@ pub fn archive(args: Args) -> io::Result<()> {
     let (buf_tx, buf_rx) = crossbeam_channel::unbounded::<Vec<u8>>();
     let (write_tx, write_rx) = crossbeam_channel::unbounded::<Package>();
 
+    // logger destination is fixed here, before any worker exists
+    let logger = Logger::spawn(
+        args.verbose,
+        output_dir,
+        &dir_name.to_string_lossy(),
+        PathBuf::from(root_parent),
+    )?;
+
     // build ExistingPaths before spawning so out_file stays on main thread
     let mut existing_paths = if args.resume {
         Some(ExistingPaths::new(&mut out_file, root_parent))
@@ -61,8 +72,9 @@ pub fn archive(args: Args) -> io::Result<()> {
     }
 
     // separate thread for collecting paths
+    let collector_log = logger.tx.clone();
     let path_collector = thread::spawn(move || -> io::Result<()> {
-        recurse_dir(&input_dir, path_tx, existing_paths.as_mut())
+        recurse_dir(&input_dir, path_tx, existing_paths.as_mut(), &collector_log)
     });
 
     println!("Allocating {}...", format_size(total_size as u64));
@@ -78,13 +90,13 @@ pub fn archive(args: Args) -> io::Result<()> {
     }
 
     let mut handles = Vec::<JoinHandle<io::Result<()>>>::with_capacity(num_workers);
-    for thread_id in 0..num_workers {
+    for _ in 0..num_workers {
         let handle = spawn_archive_thread(
-            thread_id,
             write_tx.clone(),
             path_rx.clone(),
             buf_rx.clone(),
             buf_tx.clone(),
+            logger.tx.clone(),
             PathBuf::from(root_parent),
             chunk_size as u64,
         );
@@ -94,11 +106,9 @@ pub fn archive(args: Args) -> io::Result<()> {
     drop(buf_rx);
     drop(write_tx);
 
-    let mut write_buffer = TardWriter::new(out_file, ram_split, buf_tx);
+    let mut write_buffer = TardWriter::new(out_file, ram_split, buf_tx, logger.tx.clone());
 
     for package in write_rx {
-        println!("Received package for {}", package.path.display());
-
         match write_buffer.write_package(package) {
             Ok(()) => continue,
             Err(e) => {
@@ -114,18 +124,21 @@ pub fn archive(args: Args) -> io::Result<()> {
     for handle in handles {
         let _ = handle.join().expect("Worker thread panicked");
     }
+    drop(write_buffer);
 
+    let log_path = logger.finish()?;
     println!("Finished writing to {}", out_path.display());
+    println!("Log written to {}", log_path.display());
 
     Ok(())
 }
 
 fn spawn_archive_thread(
-    thread_id: usize,
     write_tx: crossbeam_channel::Sender<Package>,
     path_rx: crossbeam_channel::Receiver<PathData>,
     buf_rx: crossbeam_channel::Receiver<Vec<u8>>,
     buf_tx: crossbeam_channel::Sender<Vec<u8>>,
+    log_tx: LogTx,
     root_parent: PathBuf,
     chunk_size: u64,
 ) -> JoinHandle<io::Result<()>> {
@@ -138,11 +151,11 @@ fn spawn_archive_thread(
                 Err(_) => return Ok(()),
             };
 
-            let path = path_data.path;
+            let PathData { path, len: file_len, mtime } = path_data;
             let mut file = match File::open(&path) {
                 Ok(f) => f,
                 Err(e) => {
-                    println!("Err -- unable to open {}: {}", path.display(), e);
+                    let _ = log_tx.send(LogMsg::Error(format!("Err -- unable to open {}: {}", path.display(), e)));
                     buf_tx.send(buf).unwrap();
                     continue;
                 }
@@ -151,32 +164,27 @@ fn spawn_archive_thread(
             let path_rel = path.strip_prefix(&root_parent).unwrap();
             let path_bytes = path_rel.as_os_str().as_bytes();
             let path_len = path_bytes.len() as u64;
-            for i in 0..8 {
-                buf.push((path_len >> (8 * i)) as u8);
-            }
+            buf.extend_from_slice(&path_len.to_le_bytes());
             buf.extend_from_slice(path_bytes);
 
-            let file_len = path_data.len;
-            for i in 0..8 {
-                buf.push((file_len >> (8 * i)) as u8);
-            }
-
-            println!("Thread {} opened {} ({})", thread_id, path.display(), format_size(file_len));
+            buf.extend_from_slice(&file_len.to_le_bytes());
 
             if file_len > chunk_size {
                 // send the entire file to the write thread
-                write_tx.send(Package::new(buf, path, PackageType::File(file, file_len))).unwrap();
+                let _ = log_tx.send(LogMsg::Entry(LogEntry { path: path.clone(), size: file_len, mtime }));
+                write_tx.send(Package::new(buf, PackageType::File(file, file_len, path))).unwrap();
             } else {
                 match file.by_ref().take(file_len).read_to_end(&mut buf) {
                     Ok(_) => (),
                     Err(e) => {
-                        println!("Err -- problem reading from {}: {}", path.display(), e);
+                        let _ = log_tx.send(LogMsg::Error(format!("Err -- problem reading from {}: {}", path.display(), e)));
                         buf.clear();
                         buf_tx.send(buf).unwrap();
                         continue;
                     }
                 }
-                write_tx.send(Package::new(buf, path, PackageType::Chunk)).unwrap();
+                write_tx.send(Package::new(buf, PackageType::Chunk)).unwrap();
+                let _ = log_tx.send(LogMsg::Entry(LogEntry { path, size: file_len, mtime }));
             }
         }
 
@@ -188,12 +196,13 @@ fn recurse_dir(
     dir: &Path,
     path_rx: crossbeam_channel::Sender<PathData>,
     mut existing: Option<&mut ExistingPaths>,
+    log_tx: &LogTx,
 ) -> io::Result<()> {
     for entry in fs::read_dir(dir)? {
         let entry = match entry {
             Ok(en) => en,
             Err(e) => {
-                eprintln!("Err -- problem with entry: {e}");
+                let _ = log_tx.send(LogMsg::Error(format!("Err -- problem with entry: {e}")));
                 continue;
             }
         };
@@ -204,23 +213,25 @@ fn recurse_dir(
             if metadata.is_file() {
                 if let Some(ref mut ex) = existing {
                     if ex.check(&path_buf) {
-                        println!("Skipping encoded file {}", path_buf.display());
+                        let _ = log_tx.send(LogMsg::Note(format!("Skipping encoded file {}", path_buf.display())));
                         continue;
                     }
                 }
+                // metadata comes from the stat read_dir already did; no extra syscall
                 let len = metadata.len();
-                if path_rx.send(PathData::new(path_buf, len)).is_err() {
+                let mtime = metadata.modified().unwrap_or(UNIX_EPOCH);
+                if path_rx.send(PathData { path: path_buf, len, mtime }).is_err() {
                     return Ok(());  // channel is closed
                 }
             } else if metadata.is_dir() {
-                match recurse_dir(&path_buf, path_rx.clone(), existing.as_deref_mut()) {
+                match recurse_dir(&path_buf, path_rx.clone(), existing.as_deref_mut(), log_tx) {
                     Ok(_) => (),
                     Err(e) => {
-                        eprintln!(
+                        let _ = log_tx.send(LogMsg::Error(format!(
                             "Err -- could not recurse {}: {}",
                             path_buf.display(),
                             e
-                        );
+                        )));
                     }
                 }
             }
@@ -234,7 +245,7 @@ fn recurse_dir(
 //
 
 struct ExistingPaths {
-    paths: Vec<PathBuf>,
+    paths: HashSet<PathBuf>,
 }
 
 impl ExistingPaths {
@@ -288,45 +299,34 @@ impl ExistingPaths {
             let _ = out_file.seek(SeekFrom::End(0));
         }
 
-        Self { paths }
+        Self { paths: paths.into_iter().collect() }
     }
 
+    // O(1) instead of a linear scan per file
     fn check(&mut self, path: &Path) -> bool {
-        for i in 0..self.paths.len() {
-            if path == self.paths[i] {
-                let _ = self.paths.remove(i);
-                return true;
-            }
-        }
-        return false;
+        self.paths.remove(path)
     }
 }
 
 struct PathData {
     path: PathBuf,
     len: u64,
-}
-
-impl PathData {
-    fn new(path: PathBuf, len: u64) -> Self {
-        Self { path, len }
-    }
+    mtime: SystemTime,
 }
 
 enum PackageType {
-    Chunk,           // extracted contents of small file
-    File(File, u64), // large file handle and length
+    Chunk,                    // extracted contents of small file
+    File(File, u64, PathBuf), // large file handle, length, path (for error reports)
 }
 
 struct Package {
     data: Vec<u8>,
-    path: PathBuf,
     package_type: PackageType,
 }
 
 impl Package {
-    fn new(data: Vec<u8>, path: PathBuf, package_type: PackageType) -> Self {
-        Self { data, path, package_type }
+    fn new(data: Vec<u8>, package_type: PackageType) -> Self {
+        Self { data, package_type }
     }
 }
 
@@ -335,6 +335,7 @@ struct TardWriter {
     out_file: File,
     buf: Vec<u8>,
     buf_tx: crossbeam_channel::Sender<Vec<u8>>, // recycles File package buffers
+    log_tx: LogTx,
     capacity: usize,
 }
 
@@ -343,11 +344,13 @@ impl TardWriter {
         out_file: File,
         capacity: usize,
         buf_tx: crossbeam_channel::Sender<Vec<u8>>,
+        log_tx: LogTx,
     ) -> Self {
         Self {
             out_file,
             buf: Vec::with_capacity(capacity),
             buf_tx,
+            log_tx,
             capacity,
         }
     }
@@ -365,7 +368,7 @@ impl TardWriter {
     }
 
     // Drain a package's data into the write buffer (flushing as needed) then recycle it.
-    fn flush_package_buffer(&mut self, path: &Path, mut p_buffer: Vec<u8>) -> io::Result<()> {
+    fn flush_package_buffer(&mut self, mut p_buffer: Vec<u8>) -> io::Result<()> {
         let mut take = p_buffer.len().min(self.space_left());
         self.fill_buffer(&mut p_buffer, take);
         while p_buffer.len() > self.space_left() {
@@ -374,7 +377,6 @@ impl TardWriter {
             take = p_buffer.len().min(self.space_left());
             self.fill_buffer(&mut p_buffer, take);
         }
-        println!("Siphoned buffer for {}", path.display());
         if self.buf_tx.send(p_buffer).is_err() { /* do nothing */ }
         Ok(())
     }
@@ -382,16 +384,16 @@ impl TardWriter {
     fn flush_package_file(&mut self, package: Package) -> io::Result<()> {
         use std::io::Read;
         
-        self.flush_package_buffer(&package.path, package.data)?;
-        let PackageType::File(mut file, mut file_len) = package.package_type else { 
-            return Ok(()); 
+        self.flush_package_buffer(package.data)?;
+        let PackageType::File(mut file, mut file_len, path) = package.package_type else {
+            return Ok(());
         };
         let mut take = file_len.min(self.space_left() as u64);
         file_len -= take;
         match file.by_ref().take(take).read_to_end(&mut self.buf) {
             Ok(_) => (),
             Err(e) => {
-                println!("Err -- problem reading from {}: {}", package.path.display(), e);
+                let _ = self.log_tx.send(LogMsg::Error(format!("Err -- problem reading from {}: {}", path.display(), e)));
                 return Ok(());
             }
         }
@@ -404,22 +406,21 @@ impl TardWriter {
             match file.by_ref().take(take).read_to_end(&mut self.buf) {
                 Ok(_) => (),
                 Err(e) => {
-                    println!("Err -- problem reading from {}: {}", package.path.display(), e);
+                    let _ = self.log_tx.send(LogMsg::Error(format!("Err -- problem reading from {}: {}", path.display(), e)));
                     return Ok(());
                 }
             }
         }
 
-        println!("Siphoned large file {}", package.path.display());
         Ok(())
     }
 
     fn write_package(&mut self, package: Package) -> io::Result<()> {
         match package.package_type {
             PackageType::Chunk => {
-                self.flush_package_buffer(&package.path, package.data)
+                self.flush_package_buffer(package.data)
             }
-            PackageType::File(_, _) => {
+            PackageType::File(..) => {
                 self.flush_package_file(package)
             }
         }

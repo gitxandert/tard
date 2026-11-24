@@ -1,9 +1,13 @@
 use std::{
     fs::{self, File},
-    path::{Path, PathBuf},
+    path::PathBuf,
     io::{self, BufReader, Read},
+    ffi::OsString,
+    os::unix::ffi::OsStringExt,
+    time::SystemTime,
 };
 use crate::cli::Args;
+use crate::utils::logger::{LogEntry, LogMsg, Logger};
 
 pub fn extract(args: Args) -> io::Result<()> {
     // validate args
@@ -26,6 +30,11 @@ pub fn extract(args: Args) -> io::Result<()> {
     };
 
     let resume = args.resume;
+
+    // logger destination is fixed here, before the reader/writer start
+    let dest_name = input.file_stem().unwrap_or_default().to_string_lossy().into_owned();
+    let logger = Logger::spawn(args.verbose, &out_path, &dest_name, out_path.clone())?;
+    let reader_log = logger.tx.clone();
 
     let (pckg_tx, pckg_rx) = crossbeam_channel::unbounded::<Package>();
     let pckg_thread = std::thread::spawn(move || -> io::Result<()> {
@@ -50,9 +59,9 @@ pub fn extract(args: Args) -> io::Result<()> {
 
             let dest = out_path.join(&path);
             if resume {
-                if dest.exists() { 
-                    println!("Skipping {}...", dest.display());
-                    continue; 
+                if dest.exists() {
+                    let _ = reader_log.send(LogMsg::Note(format!("Skipping {}...", dest.display())));
+                    continue;
                 }
             }
 
@@ -62,28 +71,33 @@ pub fn extract(args: Args) -> io::Result<()> {
 
     let mut created_dirs = std::collections::HashSet::<PathBuf>::new();
 
-    for pckg in pckg_rx {
-        let parent = pckg.dest.parent().unwrap().to_path_buf();
-        if !created_dirs.contains(&parent) {
-            fs::create_dir_all(&parent)?;
-            created_dirs.insert(parent);
+    for Package { dest, content } in pckg_rx {
+        let parent = dest.parent().unwrap();
+        // borrow for the lookup; only allocate when a new dir is seen
+        if !created_dirs.contains(parent) {
+            fs::create_dir_all(parent)?;
+            created_dirs.insert(parent.to_path_buf());
         }
-        println!("{}", pckg.dest.display());
-        fs::write(&pckg.dest, &pckg.content)?;
+        fs::write(&dest, &content)?;
+        // file was just written, so its mtime is now
+        let _ = logger.tx.send(LogMsg::Entry(LogEntry {
+            path: dest,
+            size: content.len() as u64,
+            mtime: SystemTime::now(),
+        }));
     }
 
     let _ = pckg_thread.join();
+
+    let log_path = logger.finish()?;
+    println!("Log written to {}", log_path.display());
 
     Ok(())
 }
 
 fn parse_path(reader: &mut BufReader<File>) -> io::Result<PathBuf> {
-    let path_payload = get_payload(reader)?;
-
-    let path_string = String::from_utf8(path_payload)
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid UTF-8"))?;
-
-    Ok(PathBuf::from(Path::new(&path_string)))
+    // archive stores raw OS path bytes, so decode them the same way (no UTF-8 pass)
+    Ok(PathBuf::from(OsString::from_vec(get_payload(reader)?)))
 }
 
 fn parse_content(reader: &mut BufReader<File>) -> io::Result<Vec<u8>> {

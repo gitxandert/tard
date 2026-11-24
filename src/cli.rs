@@ -47,6 +47,7 @@ fn parse_args() -> Result<Args, String> {
             "-a" | "--archive" => args_struct.cmd = Cmd::Archive,
             "-x" | "--extract" => args_struct.cmd = Cmd::Extract,
             "-c" | "--continue"  => args_struct.resume = true,
+            "-v" | "--verbose" => args_struct.verbose = true,
             "-r" | "--ram" => {
                 if let Some(a) = args.next() {
                     args_struct.max_ram = match parse_ram_arg(&a) {
@@ -111,10 +112,13 @@ Options:
   -c, --continue             Resume an interrupted run (default: {})
   -r, --ram <SIZE>           Max RAM for buffers, e.g. 512KB, 64MB, 1GB (default: {})
   -n, --num_workers <N>      Number of worker threads (default: {})
+  -v, --verbose              Also print the per-file log to stdout; it is always
+                             written to <OUTPUT_DIR>/<name>_<datetime>.log (default: {})
   -h, --help                 Show this help",
         d.resume,
         format_size(d.max_ram as u64),
         d.num_workers,
+        d.verbose,
     );
 }
 
@@ -157,6 +161,7 @@ pub struct Args {
     pub max_ram: usize,
     pub num_workers: usize,
     pub resume: bool,
+    pub verbose: bool,
 }
 
 impl Args {
@@ -169,6 +174,7 @@ impl Args {
             max_ram: 1024 * 1024 * 10, // 10MB
             num_workers: 8usize,
             resume: false,
+            verbose: false,
         }
     }
 
