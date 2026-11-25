@@ -37,8 +37,7 @@ pub fn archive(args: Args) -> io::Result<()> {
     // From here on, all output goes through it.
     let logger = Logger::spawn(
         args.verbose,
-        output_dir,
-        &dir_name.to_string_lossy(),
+        args.file_log_path(&dir_name.to_string_lossy()),
         PathBuf::from(root_parent),
     )?;
     let _ = logger.tx.send(LogMsg::Info(format!("Archiving {} to {}...", root.display(), out_path.display())));

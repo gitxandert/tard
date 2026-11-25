@@ -40,12 +40,16 @@ pub struct Logger {
 }
 
 impl Logger {
-    /// Picks the destinations once, before any worker starts: always
-    /// `<log_dir>/<dest_name>_<datetime>.log`, plus stdout when `verbose`.
+    /// Picks the destinations once, before any worker starts: always the CSV file at
+    /// `log_path` (its directory is created if needed), plus stdout when `verbose`.
     /// Entry paths are written relative to `strip_root`.
-    pub fn spawn(verbose: bool, log_dir: &Path, dest_name: &str, strip_root: PathBuf) -> io::Result<Self> {
+    pub fn spawn(verbose: bool, log_path: PathBuf, strip_root: PathBuf) -> io::Result<Self> {
         let (tx, rx) = crossbeam_channel::unbounded::<LogMsg>();
-        let log_path = log_dir.join(format!("{}_{}.log", dest_name, format_filename_time(SystemTime::now())));
+        if let Some(dir) = log_path.parent().filter(|d| !d.as_os_str().is_empty()) {
+            std::fs::create_dir_all(dir).map_err(|e| {
+                io::Error::new(e.kind(), format!("could not create log directory {}: {}", dir.display(), e))
+            })?;
+        }
         let file = File::create(&log_path).map_err(|e| {
             io::Error::new(e.kind(), format!("could not create log {}: {}", log_path.display(), e))
         })?;

@@ -35,6 +35,9 @@ express_when_full = "wait"
 [logs]
 # job logs kept in ~/.tard/server/logs (oldest are deleted first)
 keep = 100
+# where each run's per-file CSV log goes when tard isn't given -l; "~" is your home.
+# Default: logs/ in the tard directory (~/.tard/logs)
+# files = "~/.tard/logs"
 
 [schedule]
 # past runs shown by `tard server schedule <name>`
@@ -86,6 +89,8 @@ pub enum WhenFull {
 #[serde(default, deny_unknown_fields)]
 pub struct Logs {
     pub keep: usize,
+    #[serde(deserialize_with = "optional_path")]
+    pub files: Option<PathBuf>,
 }
 
 #[derive(Debug, PartialEq, Deserialize)]
@@ -120,7 +125,7 @@ impl Default for Jobs {
 
 impl Default for Logs {
     fn default() -> Self {
-        Self { keep: 100 }
+        Self { keep: 100, files: None }
     }
 }
 
@@ -186,6 +191,29 @@ impl Config {
     }
 }
 
+impl Logs {
+    /// Directory for per-file CSV logs.
+    pub fn files_dir(&self) -> PathBuf {
+        self.files.clone().unwrap_or_else(|| tard_dir().join("logs"))
+    }
+}
+
+/// Per-file CSV log directory from the config, falling back to the default if the
+/// config can't be read (a plain `tard -a` shouldn't fail over a typo in it).
+pub fn files_log_dir() -> PathBuf {
+    Config::load().map(|c| c.logs.files_dir()).unwrap_or_else(|_| tard_dir().join("logs"))
+}
+
+/// "~" or "~/..." to the home directory.
+pub fn expand_tilde(s: &str) -> PathBuf {
+    match (s.strip_prefix('~'), std::env::home_dir()) {
+        (Some(rest), Some(home)) if rest.is_empty() || rest.starts_with('/') || rest.starts_with('\\') => {
+            home.join(rest.trim_start_matches(['/', '\\']))
+        }
+        _ => PathBuf::from(s),
+    }
+}
+
 /// `$TARD_HOME`, else `~/.tard`.
 pub fn tard_dir() -> PathBuf {
     if let Some(d) = std::env::var_os("TARD_HOME") {
@@ -248,6 +276,11 @@ fn count_limit<'de, D: Deserializer<'de>>(d: D) -> Result<Limit, D::Error> {
     }
 }
 
+fn optional_path<'de, D: Deserializer<'de>>(d: D) -> Result<Option<PathBuf>, D::Error> {
+    let s = String::deserialize(d)?;
+    Ok(Some(expand_tilde(&s)))
+}
+
 fn optional_duration<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Duration>, D::Error> {
     match NumOrStr::deserialize(d)? {
         NumOrStr::Str(s) if s == "none" => Ok(None),
@@ -273,6 +306,8 @@ mod tests {
         assert_eq!(c.server.max_run_time, Some(Duration::from_secs(12 * 3600)));
         assert_eq!(c.server.port, 8273);
         assert_eq!(c.logs.keep, 100);
+        let c = Config::parse("[logs]\nfiles = \"~/somewhere\"\n").unwrap();
+        assert_eq!(c.logs.files_dir(), std::env::home_dir().unwrap().join("somewhere"));
     }
 
     #[test]

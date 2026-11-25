@@ -4,6 +4,7 @@ use std::{
     ffi::OsString,
     io::{self, BufRead, Write},
 };
+use crate::config::expand_tilde; // the shell isn't there to expand ~ in a typed line
 use crate::server::jobs;
 use crate::server::schedule::{self, Repeat, Zdt};
 
@@ -120,7 +121,7 @@ fn check_job(line: &str) -> Result<Vec<String>, String> {
     if words.is_empty() {
         return Err("give the job's input and output, plus any options".into());
     }
-    let words: Vec<OsString> = words.into_iter().map(|w| OsString::from(expand_tilde(&w))).collect();
+    let words: Vec<OsString> = words.into_iter().map(|w| expand_tilde(&w).into_os_string()).collect();
     if words.iter().any(|w| matches!(w.to_str(), Some("-q" | "--queue" | "-p" | "--parallel"))) {
         return Err("a scheduled job is a single job; -q/-p chains can't be scheduled".into());
     }
@@ -130,13 +131,6 @@ fn check_job(line: &str) -> Result<Vec<String>, String> {
         .collect()
 }
 
-/// The shell isn't there to expand ~ in a typed line, so do it here.
-fn expand_tilde(w: &str) -> String {
-    match (w.strip_prefix('~'), std::env::home_dir()) {
-        (Some(rest), Some(home)) if rest.is_empty() || rest.starts_with('/') => format!("{}{}", home.display(), rest),
-        _ => w.to_string(),
-    }
-}
 
 fn ask(label: &str, default: Option<&str>) -> Result<String, String> {
     match default {

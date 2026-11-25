@@ -25,7 +25,7 @@ const MIN_BUFFER: usize = 64 << 10;
 
 pub fn extract(args: Args) -> io::Result<()> {
     // validate args
-    let input = match args.input_dir {
+    let input = match args.input_dir.clone() {
         Some(inp) => inp,
         None => return Err(io::Error::new(io::ErrorKind::InvalidInput, "no input directory provided")),
     };
@@ -38,7 +38,7 @@ pub fn extract(args: Args) -> io::Result<()> {
         }
         None => return Err(io::Error::new(io::ErrorKind::InvalidInput, "input to tard -x must be .tard file")),
     }
-    let out_path = match args.output_dir {
+    let out_path = match args.output_dir.clone() {
         Some(oup) => oup,
         None => return Err(io::Error::new(io::ErrorKind::InvalidInput, "no output directory provided")),
     };
@@ -50,7 +50,7 @@ pub fn extract(args: Args) -> io::Result<()> {
     // logger destinations are fixed here, before the reader/workers start.
     // From here on, all output goes through it.
     let dest_name = input.file_stem().unwrap_or_default().to_string_lossy().into_owned();
-    let logger = Logger::spawn(args.verbose, &out_path, &dest_name, out_path.clone())?;
+    let logger = Logger::spawn(args.verbose, args.file_log_path(&dest_name), out_path.clone())?;
     let _ = logger.tx.send(LogMsg::Info(format!("Extracting {} to {}...", input.display(), out_path.display())));
     let _ = logger.tx.send(LogMsg::Note(format!(
         "{} workers with {} buffers (written out at {}% full)", num_workers, format_size(per_worker as u64), HIGH_WATER,

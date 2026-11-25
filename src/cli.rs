@@ -6,6 +6,7 @@ use std::{
 use crate::archive::archive::archive;
 use crate::extract::extract::extract;
 use crate::utils::formatting::{format_size, parse_size};
+use crate::utils::logger::format_filename_time;
 
 pub fn route_args() {
     let mut raw = env::args_os().skip(1);
@@ -63,6 +64,10 @@ pub fn parse_args_from<I: IntoIterator<Item = OsString>>(args: I) -> Result<Args
             "-x" | "--extract" => args_struct.cmd = Cmd::Extract,
             "-c" | "--continue"  => args_struct.resume = true,
             "-v" | "--verbose" => args_struct.verbose = true,
+            "-l" | "--log" => {
+                let v = args.next().ok_or("unspecified value for -l/--log")?;
+                args_struct.file_log = Some(std::path::absolute(&v).map_err(|e| format!("-l {}: {}", v.to_string_lossy(), e))?);
+            }
             "-r" | "--ram" => {
                 let v = args.next().ok_or("unspecified value for -r/--ram")?;
                 args_struct.max_ram = parse_size(&v.to_string_lossy())?;
@@ -118,13 +123,18 @@ Options:
   -r, --ram <SIZE>           Max RAM for buffers, e.g. 512KB, 64MB, 1GB (default: {})
   -n, --num_workers <N>      Number of worker threads (default: {})
   -v, --verbose              Also print each file's path and size, plus progress
-                             notes. A CSV log is always written to
-                             <OUTPUT_DIR>/<name>_<datetime>.log (default: {})
+                             notes (default: {})
+  -l, --log <PATH>           Where the per-file CSV log goes: a directory, for
+                             <PATH>/<name>_<datetime>.log, or a file path
+                             (default: {}, set with
+                             [logs] files in {})
   -h, --help                 Show this help",
         d.resume,
         format_size(d.max_ram as u64),
         d.num_workers,
         d.verbose,
+        crate::config::files_log_dir().display(),
+        crate::config::config_path().display(),
     );
 }
 
@@ -150,6 +160,8 @@ pub struct Args {
     /// -r / -n were given explicitly (the server sizes jobs without them)
     pub ram_given: bool,
     pub workers_given: bool,
+    /// -l: where the per-file CSV log goes (a directory, or a file path)
+    pub file_log: Option<PathBuf>,
 }
 
 impl Args {
@@ -165,7 +177,29 @@ impl Args {
             verbose: false,
             ram_given: false,
             workers_given: false,
+            file_log: None,
         }
+    }
+
+    /// The per-file CSV log for a run whose output is called `name`: inside -l if it's a
+    /// directory (or ends in a separator), at -l itself otherwise, and in the config's
+    /// [logs] files directory (default ~/.tard/logs) without -l.
+    pub fn file_log_path(&self, name: &str) -> PathBuf {
+        let dir = match &self.file_log {
+            Some(p) if p.is_dir() || p.as_os_str().to_string_lossy().ends_with(std::path::is_separator) => p.clone(),
+            Some(p) => return p.clone(),
+            None => crate::config::files_log_dir(),
+        };
+        // two runs of the same name in the same second (e.g. parallel server jobs)
+        // mustn't share a log
+        let stamp = format_filename_time(std::time::SystemTime::now());
+        let mut path = dir.join(format!("{}_{}.log", name, stamp));
+        let mut n = 2;
+        while path.exists() {
+            path = dir.join(format!("{}_{}_{}.log", name, stamp, n));
+            n += 1;
+        }
+        path
     }
 
     /// The arguments that make `tard` run this job (the inverse of parse_args_from).
@@ -175,6 +209,10 @@ impl Args {
         v.extend(self.output_dir.iter().map(|p| p.clone().into_os_string()));
         if self.resume { v.push("-c".into()); }
         if self.verbose { v.push("-v".into()); }
+        if let Some(l) = &self.file_log {
+            v.push("-l".into());
+            v.push(l.clone().into_os_string());
+        }
         if self.ram_given {
             v.push("-r".into());
             v.push(size_arg(self.max_ram).into());

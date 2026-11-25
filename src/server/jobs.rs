@@ -87,6 +87,7 @@ pub fn describe(a: &Args) -> String {
     let mut flags = Vec::new();
     if a.resume { flags.push("-c".to_string()); }
     if a.verbose { flags.push("-v".to_string()); }
+    if let Some(l) = &a.file_log { flags.push(format!("-l {}", l.display())); }
     if a.ram_given { flags.push(format!("-r {}", format_size(a.max_ram as u64).replace(' ', ""))); }
     if a.workers_given { flags.push(format!("-n {}", a.num_workers)); }
     if !flags.is_empty() {
@@ -325,6 +326,14 @@ pub fn absolutize(tokens: Vec<OsString>) -> Result<Vec<OsString>, String> {
         if s == "-r" || s == "--ram" || s == "-n" || s == "--num_workers" {
             out.push(t);
             out.extend(it.next());
+        } else if s == "-l" || s == "--log" {
+            out.push(t);
+            match it.next() {
+                Some(v) if v == "default" => out.push(v), // edit: back to the config's directory
+                // may not exist yet (a file path), so absolute rather than canonical
+                Some(v) => out.push(std::path::absolute(&v).map_err(|e| format!("{}: {}", v.to_string_lossy(), e))?.into_os_string()),
+                None => (),
+            }
         } else if s.starts_with('-') {
             out.push(t);
         } else {
@@ -336,7 +345,8 @@ pub fn absolutize(tokens: Vec<OsString>) -> Result<Vec<OsString>, String> {
 }
 
 /// `edit <id> <tokens>`: options given override the job's, `-r auto` / `-n auto` hand the
-/// choice back to the server, and paths replace the input (then the output).
+/// choice back to the server, `-l default` goes back to the config's log directory, and
+/// paths replace the input (then the output).
 pub fn edit_args(old: &Args, tokens: &[OsString]) -> Result<Args, String> {
     let mut a = old.clone();
     let mut paths = 0;
@@ -347,6 +357,10 @@ pub fn edit_args(old: &Args, tokens: &[OsString]) -> Result<Args, String> {
             "-x" | "--extract" => a.cmd = Cmd::Extract,
             "-c" | "--continue" => a.resume = true,
             "-v" | "--verbose" => a.verbose = true,
+            "-l" | "--log" => {
+                let v = it.next().ok_or("unspecified value for -l/--log")?;
+                a.file_log = if v == "default" { None } else { Some(std::path::absolute(v).map_err(|e| e.to_string())?) };
+            }
             f @ ("-r" | "--ram" | "-n" | "--num_workers") => {
                 let v = it.next().ok_or(format!("unspecified value for {}", f))?.to_string_lossy();
                 let ram = f == "-r" || f == "--ram";

@@ -399,8 +399,8 @@ Jobs:
              Continue paused jobs (with -c) as soon as there's room
   edit <ID> [<INPUT>] [<OUTPUT_DIR>] [OPTIONS]
              Change a queued or paused job: options given replace the job's,
-             -r auto / -n auto let the server decide, paths replace its input
-             (then output)
+             -r auto / -n auto let the server decide, -l default restores the
+             default CSV log location, paths replace its input (then output)
   schedule [...]
              Run jobs at set times; see tard server schedule -h
   watch      Take over the terminal with a live view of jobs and server
