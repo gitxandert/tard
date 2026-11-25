@@ -5,6 +5,7 @@ pub mod prompt;
 pub mod proto;
 pub mod queue;
 pub mod schedule;
+pub mod watch;
 
 use std::{
     fs::{self, File, OpenOptions},

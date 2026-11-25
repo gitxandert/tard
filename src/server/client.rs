@@ -57,6 +57,26 @@ pub fn main(args: Vec<OsString>) -> i32 {
             send_or(&config, &req, "server is not running (start it with: tard server start)")
         }
         Some("schedule") => schedule(&config, &args[1..]),
+        Some("watch") => {
+            use std::io::IsTerminal;
+            if !io::stdout().is_terminal() {
+                eprintln!("watch needs a terminal; for a plain stream use: tail -f {}", server_log_path().display());
+                return 2;
+            }
+            let fetch = |a: &[&str]| -> Option<String> {
+                let args: Vec<OsString> = a.iter().map(OsString::from).collect();
+                let mut out = Vec::new();
+                request(&config, &args, &mut out, &mut io::sink()).ok()?;
+                Some(String::from_utf8_lossy(&out).into_owned())
+            };
+            match crate::server::watch::run(&config, &fetch) {
+                Ok(()) => 0,
+                Err(e) => {
+                    eprintln!("Error: {}", e);
+                    1
+                }
+            }
+        }
         // anything else is a job: tard server <input> <output> [options]
         Some(_) => submit(&config, args),
     }
@@ -380,6 +400,8 @@ Jobs:
              (then output)
   schedule [...]
              Run jobs at set times; see tard server schedule -h
+  watch      Take over the terminal with a live view of jobs and server
+             output; q gives it back
 
 Server:
   start      Start the server in the background (also: bare `tard server`)

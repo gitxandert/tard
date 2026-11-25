@@ -119,9 +119,10 @@ pub fn run() -> Result<(), String> {
     Ok(())
 }
 
-/// One timestamped line of server output (stdout, which `start` points at server.log).
+/// One line of server output, stamped with local time (stdout, which `start` points at
+/// server.log).
 pub fn event(msg: &str) {
-    println!("{} {}", format_iso_time(SystemTime::now()), msg);
+    println!("{} {}", Zdt::now().strftime("%Y-%m-%d %H:%M:%S"), msg);
 }
 
 impl Daemon {
