@@ -26,7 +26,7 @@ pub fn archive(args: Args) -> io::Result<()> {
                     .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid directory"))?;
     let out_path = {
         let mut p = output_dir.join(&dir_name);
-        p.set_extension("tard");
+        p.as_mut_os_string().push(".tard"); // "photos.v2" -> "photos.v2.tard", not "photos.tard"
         p
     };
     // get root parent for formatting paths
