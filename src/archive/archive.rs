@@ -87,15 +87,12 @@ pub fn archive(args: Args) -> io::Result<()> {
         r
     });
 
-    // Arena allocation: one block carved into num_buffers chunks for regular workers.
-    let mut massive_block = Vec::with_capacity(ram_split);
-    massive_block.resize(ram_split, 0u8);
-    let mut current_block = massive_block;
+    // Reserve, don't fill: the OS only backs a page once a worker writes to it, so a
+    // large -r costs nothing until the data needs it. (This used to zero a block of
+    // ram_split and split_off each chunk, which copied it and kept the zeroed block
+    // alive too, touching ~1.5x -r up front.)
     for _ in 0..num_buffers {
-        let buffer_data = current_block.split_off(current_block.len() - chunk_size);
-        let mut buf = buffer_data;
-        buf.clear();
-        buf_tx.send(buf).unwrap();
+        buf_tx.send(Vec::with_capacity(chunk_size)).unwrap();
     }
     let _ = logger.tx.send(LogMsg::Note(format!(
         "Allocated {} ({} worker buffers of {} + {} write buffer)",
