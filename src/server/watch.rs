@@ -3,6 +3,7 @@
 // log below. q puts the terminal back exactly as it was.
 use std::{
     collections::VecDeque,
+    sync::atomic::{AtomicBool, Ordering},
     fs::File,
     io::{self, Read, Seek, SeekFrom, Write},
     time::{Duration, Instant},
@@ -16,41 +17,62 @@ use crossterm::{
 use crate::config::Config;
 use crate::server::server_log_path;
 
-const TICK: Duration = Duration::from_millis(500);
+/// How often the server is asked for its state. Fetching happens off the UI thread.
+const FETCH_EVERY: Duration = Duration::from_millis(500);
+/// How long the UI waits for a key before checking for new state or log lines.
+const FRAME: Duration = Duration::from_millis(50);
 const MAX_LINES: usize = 10_000;
 const TAIL_BYTES: u64 = 256 << 10;
 
 /// Fetches `args`' stdout from the server; None if it isn't running.
-pub type Fetch<'a> = dyn Fn(&[&str]) -> Option<String> + 'a;
+pub type Fetch<'a> = dyn Fn(&[&str]) -> Option<String> + Sync + 'a;
 
 pub fn run(config: &Config, fetch: &Fetch) -> io::Result<()> {
     let mut out = io::stdout();
     terminal::enable_raw_mode()?;
     let _restore = Restore; // leaves the alternate screen even on panic or error
-    execute!(out, terminal::EnterAlternateScreen, cursor::Hide)?;
+    execute!(out, terminal::EnterAlternateScreen, cursor::Hide, terminal::Clear(ClearType::All))?;
 
-    let mut log = LogTail::new();
-    let mut scroll = 0usize; // lines up from the bottom of the event log
-    let mut last_fetch = Instant::now() - TICK;
-    let mut jobs = String::new();
-    let mut status = String::new();
-    loop {
-        if last_fetch.elapsed() >= TICK {
-            last_fetch = Instant::now();
-            log.read_new();
-            match fetch(&["ping"]) {
-                Some(p) => {
-                    status = p.trim().trim_start_matches("server ").to_string();
-                    jobs = fetch(&["ls"]).unwrap_or_default();
+    let stop = AtomicBool::new(false);
+    let (tx, rx) = crossbeam_channel::bounded::<(String, String)>(1);
+    std::thread::scope(|scope| {
+        // the server round trips happen here, so a slow answer never stalls keys or drawing
+        scope.spawn(|| {
+            while !stop.load(Ordering::Relaxed) {
+                let state = match fetch(&["ping"]) {
+                    Some(p) => (p.trim().trim_start_matches("server ").to_string(), fetch(&["ls"]).unwrap_or_default()),
+                    None => (format!("not running (port {})", config.server.port), "start it with: tard server start".into()),
+                };
+                if tx.send(state).is_err() {
+                    return;
                 }
-                None => {
-                    status = format!("not running (port {})", config.server.port);
-                    jobs = "start it with: tard server start".into();
+                let until = Instant::now() + FETCH_EVERY;
+                while Instant::now() < until && !stop.load(Ordering::Relaxed) {
+                    std::thread::sleep(FRAME);
                 }
             }
-            draw(&mut out, &status, &jobs, &log.lines, scroll)?;
+        });
+        let r = ui(&mut out, &rx);
+        stop.store(true, Ordering::Relaxed);
+        drop(rx); // unblocks a pending send
+        r
+    })
+}
+
+fn ui(out: &mut io::Stdout, rx: &crossbeam_channel::Receiver<(String, String)>) -> io::Result<()> {
+    let mut log = LogTail::new();
+    let mut scroll = 0usize; // lines up from the bottom of the event log
+    let (mut status, mut jobs) = ("connecting...".to_string(), String::new());
+    let mut screen = Screen::default();
+    loop {
+        if let Ok((s, j)) = rx.try_recv() {
+            (status, jobs) = (s, j);
         }
-        if !event::poll(TICK.saturating_sub(last_fetch.elapsed()))? {
+        log.read_new();
+        scroll = scroll.min(log.lines.len());
+        screen.draw(out, &frame(&status, &jobs, &log.lines, scroll)?)?;
+
+        if !event::poll(FRAME)? {
             continue;
         }
         let page = terminal::size().map_or(10, |(_, h)| (h as usize / 2).max(1));
@@ -64,13 +86,11 @@ pub fn run(config: &Config, fetch: &Fetch) -> io::Result<()> {
                 KeyCode::PageDown => scroll = scroll.saturating_sub(page),
                 KeyCode::Home | KeyCode::Char('g') => scroll = log.lines.len(),
                 KeyCode::End | KeyCode::Char('G') => scroll = 0,
-                _ => continue,
+                _ => (),
             },
-            Event::Resize(..) => (),
-            _ => continue,
+            Event::Resize(..) => screen.invalidate(),
+            _ => (),
         }
-        scroll = scroll.min(log.lines.len());
-        draw(&mut out, &status, &jobs, &log.lines, scroll)?;
     }
 }
 
@@ -83,7 +103,48 @@ impl Drop for Restore {
     }
 }
 
-fn draw(out: &mut impl Write, status: &str, jobs: &str, log: &VecDeque<String>, scroll: usize) -> io::Result<()> {
+/// What's on the terminal, so each frame only rewrites the rows that changed. Nothing
+/// is cleared between frames; rows are padded instead, so there's no flicker.
+#[derive(Default)]
+struct Screen {
+    rows: Vec<String>,
+    size: (usize, usize),
+}
+
+impl Screen {
+    fn invalidate(&mut self) {
+        self.rows.clear();
+    }
+
+    fn draw(&mut self, out: &mut impl Write, (rows, size): &(Vec<String>, (usize, usize))) -> io::Result<()> {
+        if *size != self.size {
+            self.size = *size;
+            self.rows.clear();
+            queue!(out, terminal::Clear(ClearType::All))?;
+        }
+        let changed: Vec<usize> = (0..rows.len()).filter(|&i| self.rows.get(i) != Some(&rows[i])).collect();
+        if changed.is_empty() {
+            return Ok(());
+        }
+        // terminals that support it show the whole frame at once
+        queue!(out, terminal::BeginSynchronizedUpdate)?;
+        for i in changed {
+            queue!(out, cursor::MoveTo(0, i as u16))?;
+            if i == 0 {
+                queue!(out, SetAttribute(Attribute::Reverse), Print(&rows[i]), SetAttribute(Attribute::Reset))?;
+            } else {
+                queue!(out, Print(&rows[i]))?;
+            }
+        }
+        queue!(out, terminal::EndSynchronizedUpdate)?;
+        self.rows = rows.clone();
+        out.flush()
+    }
+}
+
+/// The whole screen as rows padded to the width (one column short, so writing the last
+/// row never scrolls a terminal that wraps at the edge), plus the size it was built for.
+fn frame(status: &str, jobs: &str, log: &VecDeque<String>, scroll: usize) -> io::Result<(Vec<String>, (usize, usize))> {
     let (w, h) = terminal::size()?;
     let (w, h) = (w as usize, h as usize);
     let mut rows: Vec<String> = Vec::with_capacity(h);
@@ -112,21 +173,15 @@ fn draw(out: &mut impl Write, status: &str, jobs: &str, log: &VecDeque<String>, 
     let end = log.len().saturating_sub(scroll);
     let start = end.saturating_sub(room);
     rows.extend(log.range(start..end).map(|l| format!(" {}", l)));
+    rows.resize(h, String::new());
 
-    queue!(out, terminal::Clear(ClearType::All))?;
-    for (i, r) in rows.iter().take(h).enumerate() {
-        queue!(out, cursor::MoveTo(0, i as u16))?;
-        if i == 0 {
-            // the title bar, in reverse video across the full width
-            queue!(out, SetAttribute(Attribute::Reverse), Print(fit(r, w, true)), SetAttribute(Attribute::Reset))?;
-        } else {
-            queue!(out, Print(fit(r, w, false)))?;
-        }
-    }
-    out.flush()
+    let rows = rows.into_iter().enumerate()
+        .map(|(i, r)| if i == 0 { fit(&r, w, true) } else { fit(&r, w.saturating_sub(1), true) })
+        .collect();
+    Ok((rows, (w, h)))
 }
 
-/// Cuts or pads `s` to `w` columns (padding only for the title bar's reverse video).
+/// Cuts `s` to `w` columns, padding with spaces when `pad`.
 fn fit(s: &str, w: usize, pad: bool) -> String {
     let mut t: String = s.chars().take(w).collect();
     if pad {
