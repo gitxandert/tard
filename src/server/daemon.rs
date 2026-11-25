@@ -201,13 +201,21 @@ fn spawn_job(d: &Daemon, job: &Job, alloc: Res, log: &Path) -> io::Result<Child>
     writeln!(f, "submitted {}", format_iso_time(job.submitted))?;
     writeln!(f, "started   {}", format_iso_time(SystemTime::now()))?;
     writeln!(f, "---")?;
-    Command::new(&d.exe)
-        .args(&argv)
+    let mut cmd = Command::new(&d.exe);
+    cmd.args(&argv)
         .stdin(Stdio::null())
         .stdout(f.try_clone()?)
         .stderr(f)
-        .current_dir(server_dir())
-        .spawn()
+        .current_dir(server_dir());
+    #[cfg(windows)]
+    {
+        // no console window per job, even when the server was started without one
+        // (e.g. `tard server run` from a service)
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    cmd.spawn()
 }
 
 enum Outcome {

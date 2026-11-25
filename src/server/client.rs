@@ -314,9 +314,12 @@ fn spawn_daemon() -> io::Result<()> {
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
-        const DETACHED_PROCESS: u32 = 0x8;
+        // Not DETACHED_PROCESS: a server with no console at all makes Windows open a new
+        // console window for every job it starts. CREATE_NO_WINDOW gives it a hidden
+        // console instead, which its jobs share.
         const CREATE_NEW_PROCESS_GROUP: u32 = 0x200;
-        cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP);
     }
     // don't pin the caller's working directory (it could be unmounted later)
     cmd.current_dir(server_dir()).spawn().map(drop)
