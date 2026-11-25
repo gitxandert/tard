@@ -78,7 +78,7 @@ pub fn check_name(name: &str) -> Result<(), String> {
     if name.chars().all(|c| c.is_ascii_digit()) {
         return Err("a schedule name can't be just digits (those are job ids)".into());
     }
-    if matches!(name, "ls" | "new" | "edit" | "drop" | "log" | "pause" | "resume") {
+    if matches!(name, "ls" | "new" | "edit" | "drop" | "log" | "pause" | "resume" | "queued" | "paused" | "running" | "all") {
         return Err(format!("'{}' is a schedule command, so it can't be a name", name));
     }
     Ok(())
