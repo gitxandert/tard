@@ -48,6 +48,7 @@ pub fn archive(args: Args) -> io::Result<()> {
         .read(args.resume)
         .write(true)
         .append(args.resume)
+        .truncate(!args.resume) // a fresh run over an old, longer archive would leave its tail
         .create(true)
         .open(&out_path)
     {
