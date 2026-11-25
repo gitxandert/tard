@@ -103,23 +103,47 @@ fn read_archive(
     skipped: &mut usize,
 ) -> io::Result<Eof> {
     let mut reader = BufReader::new(File::open(input)?);
+    // Files are extracted in archive order, so an interrupted run leaves at most one
+    // half-written file: the last one that exists before the first missing one.
+    // It's held back here and rewritten instead of skipped.
+    let mut last_existing: Option<Package> = None;
+    let rewrite = |last: &mut Option<Package>, skipped: &mut usize| {
+        if let Some(p) = last.take() {
+            *skipped -= 1;
+            let _ = pckg_tx.send(p);
+        }
+    };
+    let mut boundary_found = false;
     loop {
         let path = match parse_path(&mut reader) {
             Ok(p) => p,
-            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(Eof::Clean),
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                rewrite(&mut last_existing, skipped); // interrupted on the very last file
+                return Ok(Eof::Clean);
+            }
             Err(e) => return Err(e),
         };
 
         let content = match parse_content(&mut reader) {
             Ok(c) => c,
-            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(Eof::Truncated),
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                rewrite(&mut last_existing, skipped);
+                return Ok(Eof::Truncated);
+            }
             Err(e) => return Err(e),
         };
 
         let dest = out_path.join(&path);
         if resume && dest.exists() {
             *skipped += 1;
+            if !boundary_found {
+                last_existing = Some(Package::new(dest, content));
+            }
             continue;
+        }
+        if !boundary_found {
+            boundary_found = true;
+            rewrite(&mut last_existing, skipped);
         }
 
         let _ = pckg_tx.send(Package::new(dest, content));
