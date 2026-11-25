@@ -1,14 +1,15 @@
 // Jobs as the server sees them, and their log files:
 // ~/.tard/server/logs/<YYYY-MM-DD_HH-MM-SS>_<id>_<input name>.log (UTC)
 use std::{
-    ffi::OsString,
+    ffi::{OsStr, OsString},
     fs, io,
     path::{Path, PathBuf},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use crate::cli::{Args, Cmd, parse_args_from};
+use crate::server::queue::{ChainId, Lane};
 use crate::server::server_dir;
-use crate::utils::formatting::format_size;
+use crate::utils::formatting::{format_size, parse_size};
 use crate::utils::logger::format_filename_time;
 use crate::utils::path::{bytes_to_path, path_to_bytes};
 
@@ -137,21 +138,26 @@ pub fn prune_logs(dir: &Path, keep: usize, protect: &[&Path]) {
     }
 }
 
-// Queue persistence: the queue is saved on every change, so it survives a stop or crash.
-// Format: per job, u64 id, u64 submitted (unix secs), u32 argc, then each arg as
-// u32 length + path bytes.
+// Queue persistence: saved on every change, so the queue survives a stop or crash.
+// Format: MAGIC, then per job: u64 id, u64 submitted (unix secs), u64 chain, u32 group,
+// u8 lane (0 main, 1 express, 2 paused), u32 argc, then each arg as u32 length + bytes.
+
+const MAGIC: &[u8] = b"tard-queue-1\n";
 
 pub fn queue_path() -> PathBuf {
     server_dir().join("queue")
 }
 
-pub fn save_queue<'a, I: IntoIterator<Item = &'a Job>>(jobs: I) -> io::Result<()> {
-    let mut b = Vec::new();
-    for j in jobs {
-        let argv = j.args.to_argv();
+pub fn save_queue(entries: &[(&Job, ChainId, usize, Option<Lane>)]) -> io::Result<()> {
+    let mut b = MAGIC.to_vec();
+    for (j, chain, group, lane) in entries {
         b.extend_from_slice(&j.id.to_le_bytes());
         let secs = j.submitted.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
         b.extend_from_slice(&secs.to_le_bytes());
+        b.extend_from_slice(&chain.to_le_bytes());
+        b.extend_from_slice(&(*group as u32).to_le_bytes());
+        b.push(match lane { Some(Lane::Main) => 0, Some(Lane::Express) => 1, None => 2 });
+        let argv = j.args.to_argv();
         b.extend_from_slice(&(argv.len() as u32).to_le_bytes());
         for a in argv {
             let bytes = path_to_bytes(Path::new(&a))?;
@@ -167,45 +173,197 @@ pub fn save_queue<'a, I: IntoIterator<Item = &'a Job>>(jobs: I) -> io::Result<()
 
 /// Saved jobs, with any whose arguments no longer check out (e.g. a path was deleted)
 /// returned separately with the reason.
-pub fn load_queue() -> (Vec<Job>, Vec<(JobId, String)>) {
+pub fn load_queue() -> (Vec<(Job, ChainId, usize, Option<Lane>)>, Vec<(JobId, String)>) {
     let Ok(b) = fs::read(queue_path()) else { return (Vec::new(), Vec::new()) };
-    let mut r = b.as_slice();
     let mut jobs = Vec::new();
     let mut bad = Vec::new();
+    let Some(mut r) = b.strip_prefix(MAGIC) else {
+        bad.push((0, "queue file is from another version; ignored".to_string()));
+        return (jobs, bad);
+    };
     while !r.is_empty() {
-        let Some((id, secs, argv)) = read_job(&mut r) else {
+        let Some((id, secs, chain, group, lane, argv)) = read_job(&mut r) else {
             bad.push((0, "queue file is corrupt; the rest of it was skipped".to_string()));
             break;
         };
         match parse_job(argv) {
-            Ok(args) => jobs.push(Job { id, args, submitted: UNIX_EPOCH + Duration::from_secs(secs) }),
+            Ok(args) => jobs.push((Job { id, args, submitted: UNIX_EPOCH + Duration::from_secs(secs) }, chain, group, lane)),
             Err(e) => bad.push((id, e)),
         }
     }
     (jobs, bad)
 }
 
-fn read_job(r: &mut &[u8]) -> Option<(JobId, u64, Vec<OsString>)> {
+type Entry = (JobId, u64, ChainId, usize, Option<Lane>, Vec<OsString>);
+
+fn read_job(r: &mut &[u8]) -> Option<Entry> {
     fn take<'a>(r: &mut &'a [u8], n: usize) -> Option<&'a [u8]> {
         if r.len() < n { return None; }
         let (a, b) = r.split_at(n);
         *r = b;
         Some(a)
     }
-    let id = u64::from_le_bytes(take(r, 8)?.try_into().ok()?);
-    let secs = u64::from_le_bytes(take(r, 8)?.try_into().ok()?);
-    let argc = u32::from_le_bytes(take(r, 4)?.try_into().ok()?) as usize;
+    let u64_ = |r: &mut &[u8]| take(r, 8).map(|b| u64::from_le_bytes(b.try_into().unwrap()));
+    let u32_ = |r: &mut &[u8]| take(r, 4).map(|b| u32::from_le_bytes(b.try_into().unwrap()));
+    let id = u64_(r)?;
+    let secs = u64_(r)?;
+    let chain = u64_(r)?;
+    let group = u32_(r)? as usize;
+    let lane = match take(r, 1)?[0] { 0 => Some(Lane::Main), 1 => Some(Lane::Express), 2 => None, _ => return None };
+    let argc = u32_(r)? as usize;
     let mut argv = Vec::with_capacity(argc.min(64));
     for _ in 0..argc {
-        let len = u32::from_le_bytes(take(r, 4)?.try_into().ok()?) as usize;
+        let len = u32_(r)? as usize;
         argv.push(bytes_to_path(take(r, len)?.to_vec()).ok()?.into_os_string());
     }
-    Some((id, secs, argv))
+    Some((id, secs, chain, group, lane, argv))
+}
+
+// Chains and edits on the command line
+
+fn is_sep(a: &OsStr) -> Option<Sep> {
+    match a.to_str()? {
+        "-q" | "--queue" => Some(Sep::Queue),
+        "-p" | "--parallel" => Some(Sep::Parallel),
+        _ => None,
+    }
+}
+
+#[derive(PartialEq)]
+enum Sep {
+    Queue,
+    Parallel,
+}
+
+/// Splits `A.. -p B.. -q C..` into groups of jobs' argv: [[A, B], [C]]. A leading -p puts
+/// the whole submission in the express lane; a leading -q is the same as none.
+pub fn split_chain(tokens: Vec<OsString>) -> Result<(Lane, Vec<Vec<Vec<OsString>>>), String> {
+    let mut lane = Lane::Main;
+    let mut groups: Vec<Vec<Vec<OsString>>> = vec![vec![Vec::new()]];
+    for (i, t) in tokens.into_iter().enumerate() {
+        let Some(sep) = is_sep(&t) else {
+            groups.last_mut().unwrap().last_mut().unwrap().push(t);
+            continue;
+        };
+        if i == 0 {
+            if sep == Sep::Parallel { lane = Lane::Express; }
+            continue;
+        }
+        if groups.last().unwrap().last().unwrap().is_empty() {
+            return Err(format!("{} must follow a job's arguments", t.to_string_lossy()));
+        }
+        match sep {
+            Sep::Parallel => groups.last_mut().unwrap().push(Vec::new()),
+            Sep::Queue => groups.push(vec![Vec::new()]),
+        }
+    }
+    if groups.last().unwrap().last().unwrap().is_empty() {
+        return Err("expected a job (<input> <output> [options]) after the last -q/-p".into());
+    }
+    Ok((lane, groups))
+}
+
+/// Rebuilds a chain as tokens for `split_chain` on the server.
+pub fn join_chain(lane: Lane, groups: &[Vec<Args>]) -> Vec<OsString> {
+    let mut v: Vec<OsString> = Vec::new();
+    if lane == Lane::Express { v.push("-p".into()); }
+    for (gi, g) in groups.iter().enumerate() {
+        for (ji, a) in g.iter().enumerate() {
+            if ji > 0 { v.push("-p".into()); } else if gi > 0 { v.push("-q".into()); }
+            v.extend(a.to_argv());
+        }
+    }
+    v
+}
+
+/// Makes the paths in `edit` tokens absolute (they're resolved on the server otherwise).
+pub fn absolutize(tokens: Vec<OsString>) -> Result<Vec<OsString>, String> {
+    let mut out = Vec::with_capacity(tokens.len());
+    let mut it = tokens.into_iter();
+    while let Some(t) = it.next() {
+        let s = t.to_string_lossy();
+        if s == "-r" || s == "--ram" || s == "-n" || s == "--num_workers" {
+            out.push(t);
+            out.extend(it.next());
+        } else if s.starts_with('-') {
+            out.push(t);
+        } else {
+            let p = PathBuf::from(&t).canonicalize().map_err(|e| format!("{}: {}", s, e))?;
+            out.push(p.into_os_string());
+        }
+    }
+    Ok(out)
+}
+
+/// `edit <id> <tokens>`: options given override the job's, `-r auto` / `-n auto` hand the
+/// choice back to the server, and paths replace the input (then the output).
+pub fn edit_args(old: &Args, tokens: &[OsString]) -> Result<Args, String> {
+    let mut a = old.clone();
+    let mut paths = 0;
+    let mut it = tokens.iter();
+    while let Some(t) = it.next() {
+        match t.to_str().unwrap_or("") {
+            "-a" | "--archive" => a.cmd = Cmd::Archive,
+            "-x" | "--extract" => a.cmd = Cmd::Extract,
+            "-c" | "--continue" => a.resume = true,
+            "-v" | "--verbose" => a.verbose = true,
+            f @ ("-r" | "--ram" | "-n" | "--num_workers") => {
+                let v = it.next().ok_or(format!("unspecified value for {}", f))?.to_string_lossy();
+                let ram = f == "-r" || f == "--ram";
+                if v == "auto" {
+                    if ram { a.ram_given = false } else { a.workers_given = false }
+                } else if ram {
+                    a.max_ram = parse_size(&v)?;
+                    a.ram_given = true;
+                } else {
+                    a.num_workers = v.parse().ok().filter(|n| *n > 0).ok_or("-n needs a number of at least 1")?;
+                    a.workers_given = true;
+                }
+            }
+            s if s.starts_with('-') => return Err(format!("unknown option {}", s)),
+            _ => {
+                let p = PathBuf::from(t).canonicalize().map_err(|e| format!("{}: {}", t.to_string_lossy(), e))?;
+                match paths {
+                    0 => a.input_dir = Some(p),
+                    1 => a.output_dir = Some(p),
+                    _ => return Err("an edit takes at most an input and an output".into()),
+                }
+                paths += 1;
+            }
+        }
+    }
+    validate(&a)?;
+    Ok(a)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn os(v: &[&str]) -> Vec<OsString> {
+        v.iter().map(OsString::from).collect()
+    }
+
+    #[test]
+    fn chains() {
+        let (lane, g) = split_chain(os(&["a", "b", "-p", "c", "d", "-q", "e", "f"])).unwrap();
+        assert_eq!(lane, Lane::Main);
+        assert_eq!(g, vec![vec![os(&["a", "b"]), os(&["c", "d"])], vec![os(&["e", "f"])]]);
+        let (lane, g) = split_chain(os(&["-p", "a", "b"])).unwrap();
+        assert_eq!((lane, g.len()), (Lane::Express, 1));
+        assert_eq!(split_chain(os(&["-q", "a", "b"])).unwrap().0, Lane::Main);
+        assert!(split_chain(os(&["a", "b", "-q"])).is_err());
+        assert!(split_chain(os(&["a", "b", "-q", "-p", "c", "d"])).is_err());
+    }
+
+    #[test]
+    fn edits() {
+        let old = parse_job(os(&["/", "/", "-r", "64MB"])).unwrap();
+        let e = edit_args(&old, &os(&["-r", "auto", "-n", "3", "-v"])).unwrap();
+        assert!(!e.ram_given && e.workers_given && e.num_workers == 3 && e.verbose);
+        assert!(edit_args(&old, &os(&["-z"])).is_err());
+        assert!(edit_args(&old, &os(&["/nonexistent-path"])).is_err());
+    }
 
     #[test]
     fn log_names() {

@@ -1,6 +1,5 @@
 // The long-running server: `tard server run` (start spawns it detached).
 use std::{
-    collections::VecDeque,
     ffi::OsString,
     fs::{self, File, OpenOptions},
     io::{self, BufReader, BufWriter, Read, Write},
@@ -11,11 +10,13 @@ use std::{
     thread,
     time::{Duration, SystemTime},
 };
-use crate::config::Config;
+use crate::cli::Cmd;
+use crate::config::{Config, WhenFull};
 use crate::server::jobs::{self, Job, JobId};
 use crate::server::proto::{self, Frame};
+use crate::server::queue::{Chain, Limits, Queue, Res, Running, Spot, StopRequest};
 use crate::server::{create_private_dir, create_private_file, pid_path, server_dir, token_path};
-use crate::utils::formatting::format_duration;
+use crate::utils::formatting::{format_duration, format_size};
 use crate::utils::logger::format_iso_time;
 use crate::utils::path::bytes_to_path;
 
@@ -25,25 +26,18 @@ const STOP_TIMEOUT: Duration = Duration::from_secs(10);
 struct Daemon {
     token: Vec<u8>,
     config: Config,
+    limits: Limits,
     started: SystemTime,
     exe: PathBuf, // this binary, run for each job
     state: Mutex<State>,
-    /// signalled whenever the queue or the running set changes
-    wake: Condvar,
+    /// signalled whenever a running job finishes
+    finished: Condvar,
 }
 
 struct State {
     next_id: JobId,
-    queue: VecDeque<Job>,
-    running: Vec<Running>,
+    q: Queue,
     stopping: bool,
-}
-
-struct Running {
-    job: Job,
-    log: PathBuf,
-    started: SystemTime,
-    drop_requested: bool,
 }
 
 /// Runs the server in the foreground until `tard server stop`.
@@ -62,31 +56,41 @@ pub fn run() -> Result<(), String> {
     let token = new_token();
     write_private(&token_path(), &token)?;
     write_private(&pid_path(), std::process::id().to_string().as_bytes())?;
-    event(&format!("server started on 127.0.0.1:{} (pid {})", port, std::process::id()));
 
-    let (queue, bad) = jobs::load_queue();
+    let limits = Limits {
+        total: Res { ram: config.server_ram(), workers: config.server_workers() },
+        max_jobs: config.server.max_parallel_jobs,
+        min: Res { ram: config.jobs.min_ram, workers: config.jobs.min_workers },
+        max: Res { ram: config.jobs.max_ram, workers: config.jobs.max_workers },
+        shrink_express: config.jobs.express_when_full == WhenFull::Shrink,
+    };
+    event(&format!(
+        "server started on 127.0.0.1:{} (pid {}); sharing {} and {} workers across up to {} jobs",
+        port, std::process::id(), fmt_ram(limits.total.ram), limits.total.workers, limits.max_jobs,
+    ));
+
+    let (saved, bad) = jobs::load_queue();
     for (id, why) in bad {
         event(&format!("job {} dropped from the saved queue: {}", id, why));
     }
-    if !queue.is_empty() {
-        event(&format!("restored {} queued job(s)", queue.len()));
+    if !saved.is_empty() {
+        event(&format!("restored {} waiting job(s)", saved.len()));
     }
     let next_id = read_next_id()
         .max(jobs::max_logged_id(&jobs::logs_dir()) + 1)
-        .max(queue.iter().map(|j| j.id + 1).max().unwrap_or(1));
+        .max(saved.iter().map(|(j, ..)| j.id + 1).max().unwrap_or(1));
 
     let daemon = Arc::new(Daemon {
         token,
         config,
+        limits,
         started: SystemTime::now(),
         exe,
-        state: Mutex::new(State { next_id, queue: queue.into(), running: Vec::new(), stopping: false }),
-        wake: Condvar::new(),
+        state: Mutex::new(State { next_id, q: Queue::restore(saved), stopping: false }),
+        finished: Condvar::new(),
     });
-    let _ = jobs::save_queue(&daemon.lock().queue); // drops any jobs that failed to load
-
-    let d = Arc::clone(&daemon);
-    thread::spawn(move || dispatch(d));
+    save(&daemon.lock().q); // drops any jobs that failed to load
+    kick(&daemon);
 
     for stream in listener.incoming() {
         match stream {
@@ -116,51 +120,76 @@ impl Daemon {
     fn lock(&self) -> MutexGuard<'_, State> {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
+}
 
-    fn max_running(&self) -> usize {
-        1 // jobs run one at a time until parallel jobs land
+fn save(q: &Queue) {
+    if let Err(e) = jobs::save_queue(&q.saved()) {
+        event(&format!("could not save the queue: {}", e));
     }
+}
+
+fn fmt_ram(n: usize) -> String {
+    format_size(n as u64).replace(' ', "")
 }
 
 // running jobs
 
-/// Starts queued jobs as room frees up.
-fn dispatch(d: Arc<Daemon>) {
-    loop {
-        let (job, log) = {
-            let mut st = d.lock();
-            while st.stopping || st.queue.is_empty() || st.running.len() >= d.max_running() {
-                st = d.wake.wait(st).unwrap_or_else(|e| e.into_inner());
-            }
-            let job = st.queue.pop_front().unwrap();
-            let _ = jobs::save_queue(&st.queue);
-            let started = SystemTime::now();
-            let log = jobs::new_log_path(&jobs::logs_dir(), job.id, &job.args, started);
-            // moved to running under the same lock, so `ls` and `drop` always see it
-            st.running.push(Running { job: job.clone(), log: log.clone(), started, drop_requested: false });
-            (job, log)
-        };
+/// Starts whatever the queue says can run now. Called after anything that adds work or
+/// frees resources. Returns the ids started.
+fn kick(d: &Arc<Daemon>) -> Vec<JobId> {
+    let starts: Vec<(Job, Res, PathBuf)> = {
+        let mut st = d.lock();
+        if st.stopping {
+            return Vec::new();
+        }
+        let planned = st.q.plan(&d.limits);
+        let now = SystemTime::now();
+        let starts = planned.into_iter().map(|s| {
+            let log = jobs::new_log_path(&jobs::logs_dir(), s.job.id, &s.job.args, now);
+            // into running under the same lock, so `ls` and `drop` always see the job
+            st.q.running.push(Running { job: s.job.clone(), chain: s.chain, alloc: s.alloc, log: log.clone(), started: now, stop: None });
+            (s.job, s.alloc, log)
+        }).collect();
+        if !st.q.running.is_empty() {
+            save(&st.q);
+        }
+        starts
+    };
+    let mut ids = Vec::new();
+    for (job, alloc, log) in starts {
+        ids.push(job.id);
         let started = SystemTime::now();
-        match spawn_job(&d, &job, &log) {
+        match spawn_job(d, &job, alloc, &log) {
             Ok(child) => {
-                event(&format!("job {} started: {}", job.id, jobs::describe(&job.args)));
-                let d = Arc::clone(&d);
+                event(&format!("job {} started with {}, {} workers: {}", job.id, fmt_ram(alloc.ram), alloc.workers, jobs::describe(&job.args)));
+                let d = Arc::clone(d);
                 thread::spawn(move || supervise(d, job.id, child, log, started));
             }
             Err(e) => {
                 append(&log, &format!("--- could not start: {}\n", e));
                 event(&format!("job {} could not start: {}", job.id, e));
-                finish(&d, job.id, &log);
+                let d = Arc::clone(d);
+                // finish() kicks again, so don't do it while this kick is still unwinding
+                thread::spawn(move || finish(&d, job.id, Ended::Failed));
             }
         }
     }
+    ids
 }
 
-fn spawn_job(d: &Daemon, job: &Job, log: &Path) -> io::Result<Child> {
+fn spawn_job(d: &Daemon, job: &Job, alloc: Res, log: &Path) -> io::Result<Child> {
+    let mut args = job.args.clone();
+    if args.cmd == Cmd::Archive {
+        args.max_ram = alloc.ram;
+        args.num_workers = alloc.workers;
+        args.ram_given = true;
+        args.workers_given = true;
+    }
+    let argv = args.to_argv();
     let mut f = create_private_file(log)?;
-    let argv = job.args.to_argv();
     writeln!(f, "job {}: {}", job.id, jobs::describe(&job.args))?;
     writeln!(f, "command: tard {}", argv.iter().map(|a| a.to_string_lossy()).collect::<Vec<_>>().join(" "))?;
+    writeln!(f, "resources: {}, {} workers", fmt_ram(alloc.ram), alloc.workers)?;
     writeln!(f, "submitted {}", format_iso_time(job.submitted))?;
     writeln!(f, "started   {}", format_iso_time(SystemTime::now()))?;
     writeln!(f, "---")?;
@@ -175,12 +204,19 @@ fn spawn_job(d: &Daemon, job: &Job, log: &Path) -> io::Result<Child> {
 
 enum Outcome {
     Exited(ExitStatus),
-    Dropped,
+    Stopped(StopRequest),
     TimedOut(Duration),
     Lost(io::Error),
 }
 
-/// Waits for one job, killing it if it's dropped or runs past max_run_time.
+/// How a run ended, as far as the queue cares.
+enum Ended {
+    Ok,
+    Failed,
+    Stopped(StopRequest),
+}
+
+/// Waits for one job, killing it if it's dropped, paused, or runs past max_run_time.
 fn supervise(d: Arc<Daemon>, id: JobId, mut child: Child, log: PathBuf, started: SystemTime) {
     let max = d.config.server.max_run_time;
     let outcome = loop {
@@ -189,11 +225,11 @@ fn supervise(d: Arc<Daemon>, id: JobId, mut child: Child, log: PathBuf, started:
             Err(e) => break Outcome::Lost(e),
             Ok(None) => (),
         }
-        let dropped = d.lock().running.iter().any(|r| r.job.id == id && r.drop_requested);
-        if dropped {
+        let stop = d.lock().q.running.iter().find(|r| r.job.id == id).and_then(|r| r.stop);
+        if let Some(req) = stop {
             let _ = child.kill();
             let _ = child.wait();
-            break Outcome::Dropped;
+            break Outcome::Stopped(req);
         }
         if let Some(m) = max.filter(|m| started.elapsed().unwrap_or_default() > *m) {
             let _ = child.kill();
@@ -204,29 +240,47 @@ fn supervise(d: Arc<Daemon>, id: JobId, mut child: Child, log: PathBuf, started:
     };
 
     let took = format_duration(started.elapsed().unwrap_or_default());
-    let summary = match outcome {
-        Outcome::Exited(s) if s.success() => format!("finished in {}", took),
-        Outcome::Exited(s) => match s.code() {
+    let (summary, ended) = match outcome {
+        Outcome::Exited(s) if s.success() => (format!("finished in {}", took), Ended::Ok),
+        Outcome::Exited(s) => (match s.code() {
             Some(c) => format!("failed (exit {}) after {}", c, took),
             None => format!("failed (killed by a signal) after {}", took),
-        },
-        Outcome::Dropped => format!("dropped after {}", took),
-        Outcome::TimedOut(m) => format!("dropped: ran past max_run_time ({})", format_duration(m)),
-        Outcome::Lost(e) => format!("lost track of the process: {}", e),
+        }, Ended::Failed),
+        Outcome::Stopped(StopRequest::Drop) => (format!("dropped after {}", took), Ended::Stopped(StopRequest::Drop)),
+        Outcome::Stopped(StopRequest::Pause) => (format!("paused after {} (resume continues it)", took), Ended::Stopped(StopRequest::Pause)),
+        Outcome::Stopped(StopRequest::Requeue) => (format!("stopped with the server after {}; resumes on next start", took), Ended::Stopped(StopRequest::Requeue)),
+        Outcome::TimedOut(m) => (format!("dropped: ran past max_run_time ({})", format_duration(m)), Ended::Failed),
+        Outcome::Lost(e) => (format!("lost track of the process: {}", e), Ended::Failed),
     };
     append(&log, &format!("--- {} ({})\n", summary, format_iso_time(SystemTime::now())));
     event(&format!("job {} {}", id, summary));
-    finish(&d, id, &log);
+    finish(&d, id, ended);
 }
 
-/// Takes a job out of `running` once its log is complete, and lets the next one start.
-fn finish(d: &Daemon, id: JobId, log: &Path) {
+/// Takes a job out of `running` once its log is complete, then starts what can run.
+fn finish(d: &Arc<Daemon>, id: JobId, ended: Ended) {
     let mut st = d.lock();
-    st.running.retain(|r| r.job.id != id);
-    let live: Vec<&Path> = st.running.iter().map(|r| r.log.as_path()).collect();
-    jobs::prune_logs(log.parent().unwrap_or(Path::new(".")), d.config.logs.keep, &live);
+    if let Ended::Stopped(StopRequest::Requeue) = ended {
+        if let Some(r) = st.q.running.iter().find(|r| r.job.id == id) {
+            let (job, chain) = (r.job.clone(), r.chain);
+            st.q.put_back(job, chain);
+        }
+    }
+    let (r, skipped) = st.q.finished(id, matches!(ended, Ended::Failed));
+    if let (Some(r), Ended::Stopped(StopRequest::Pause)) = (&r, &ended) {
+        let mut job = r.job.clone();
+        job.args.resume = true;
+        st.q.paused.push(job);
+    }
+    for j in &skipped {
+        event(&format!("job {} skipped: job {} earlier in its chain failed", j.id, id));
+    }
+    save(&st.q);
+    let live: Vec<&Path> = st.q.running.iter().map(|r| r.log.as_path()).collect();
+    jobs::prune_logs(&jobs::logs_dir(), d.config.logs.keep, &live);
     drop(st);
-    d.wake.notify_all();
+    d.finished.notify_all();
+    kick(d);
 }
 
 fn append(log: &Path, text: &str) {
@@ -237,7 +291,7 @@ fn append(log: &Path, text: &str) {
 
 // requests
 
-fn handle(d: &Daemon, stream: TcpStream) -> io::Result<()> {
+fn handle(d: &Arc<Daemon>, stream: TcpStream) -> io::Result<()> {
     stream.set_read_timeout(Some(Duration::from_secs(10)))?;
     let (token, args) = proto::read_request(&mut BufReader::new(&stream))?;
     let mut reply = Reply(BufWriter::new(&stream));
@@ -253,6 +307,7 @@ fn handle(d: &Daemon, stream: TcpStream) -> io::Result<()> {
         return reply.exit(2);
     };
     let rest = &args[1..];
+    let ids_usage = |verb: &str| format!("usage: tard server {} <job id>...", verb);
 
     let code = match cmd {
         "ping" => {
@@ -269,8 +324,9 @@ fn handle(d: &Daemon, stream: TcpStream) -> io::Result<()> {
             [key] => log(d, &mut reply, &key.to_string_lossy())?,
             _ => { reply.err("usage: tard server log <job id | input name>")?; 2 }
         },
-        "drop" if !rest.is_empty() => drop_jobs(d, &mut reply, rest)?,
-        "drop" => { reply.err("usage: tard server drop <job id>...")?; 2 }
+        "drop" | "pause" | "resume" if rest.is_empty() => { reply.err(&ids_usage(cmd))?; 2 }
+        "drop" | "pause" | "resume" => for_each_id(d, &mut reply, cmd, rest)?,
+        "edit" => edit(d, &mut reply, rest)?,
         "stop" => {
             let wait = rest.iter().any(|a| a == "--wait" || a == "-w");
             stop(d, &mut reply, wait)?;
@@ -285,56 +341,113 @@ fn handle(d: &Daemon, stream: TcpStream) -> io::Result<()> {
     reply.exit(code)
 }
 
-fn submit(d: &Daemon, reply: &mut Reply, argv: Vec<OsString>) -> io::Result<i32> {
-    let args = match jobs::parse_job(argv) {
-        Ok(a) => a,
+fn submit(d: &Arc<Daemon>, reply: &mut Reply, tokens: Vec<OsString>) -> io::Result<i32> {
+    let parsed = jobs::split_chain(tokens).and_then(|(lane, groups)| {
+        let groups = groups.into_iter()
+            .map(|g| g.into_iter().map(jobs::parse_job).collect::<Result<Vec<_>, _>>())
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok((lane, groups))
+    });
+    let (lane, groups) = match parsed {
+        Ok(p) => p,
         Err(e) => {
             reply.err(&format!("Error: {}", e))?;
             return Ok(2);
         }
     };
+
     let mut st = d.lock();
     if st.stopping {
         reply.err("server is stopping; job not accepted")?;
         return Ok(1);
     }
-    let id = st.next_id;
-    st.next_id += 1;
+    let now = SystemTime::now();
+    let mut ids: Vec<Vec<JobId>> = Vec::new();
+    let groups = groups.into_iter().map(|g| {
+        let mut gi = Vec::new();
+        let g = g.into_iter().map(|args| {
+            let id = st.next_id;
+            st.next_id += 1;
+            gi.push(id);
+            Job { id, args, submitted: now }
+        }).collect::<Vec<_>>();
+        ids.push(gi);
+        g
+    }).collect();
     write_next_id(st.next_id);
-    let ahead = st.running.len() + st.queue.len();
-    let room = st.running.len() < d.max_running() && st.queue.is_empty();
-    let desc = jobs::describe(&args);
-    st.queue.push_back(Job { id, args, submitted: SystemTime::now() });
-    if let Err(e) = jobs::save_queue(&st.queue) {
-        event(&format!("could not save the queue: {}", e));
+    let chain_id = ids[0][0];
+    st.q.submit(Chain { id: chain_id, lane, groups });
+    let descs: Vec<(JobId, String)> = st.q.waiting().iter()
+        .filter(|(j, _)| ids.iter().flatten().any(|i| *i == j.id))
+        .map(|(j, _)| (j.id, jobs::describe(&j.args)))
+        .collect();
+    save(&st.q);
+    drop(st);
+    for (id, desc) in &descs {
+        event(&format!("job {} submitted: {}", id, desc));
+    }
+
+    let started = kick(d);
+    let st = d.lock();
+    let spots = st.q.waiting();
+    for (gi, g) in ids.iter().enumerate() {
+        for (ji, id) in g.iter().enumerate() {
+            let desc = &descs.iter().find(|(i, _)| i == id).unwrap().1;
+            let when = if started.contains(id) {
+                "started".to_string()
+            } else {
+                let after = match (ji, gi) {
+                    (0, 0) => String::new(),
+                    (0, _) => format!(", after {}", join_ids(&ids[gi - 1])),
+                    _ => format!(", alongside {}", g[0]),
+                };
+                match spots.iter().find(|(j, _)| j.id == *id).map(|(_, s)| s) {
+                    Some(Spot::Queued(n)) => format!("queued (#{} in line{})", n, after),
+                    Some(Spot::Express) => format!("waiting for room ahead of the queue{}", after),
+                    // finished or failed to start in the meantime
+                    _ => "submitted".to_string(),
+                }
+            };
+            reply.out(&format!("job {} {}: {}", id, when, desc))?;
+        }
     }
     drop(st);
-    d.wake.notify_all();
-
-    event(&format!("job {} submitted: {}", id, desc));
-    if room {
-        reply.out(&format!("job {} started: {}", id, desc))?;
-    } else {
-        reply.out(&format!("job {} queued ({} ahead): {}", id, ahead, desc))?;
-    }
-    reply.out(&format!("  follow it with: tard server log {}", id))?;
+    reply.out(&format!("  follow with: tard server log <id>   (e.g. tard server log {})", chain_id))?;
     Ok(0)
+}
+
+fn join_ids(ids: &[JobId]) -> String {
+    ids.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(", ")
 }
 
 fn ls(d: &Daemon, reply: &mut Reply) -> io::Result<i32> {
     let st = d.lock();
-    if st.running.is_empty() && st.queue.is_empty() {
-        reply.out("no jobs running or queued")?;
+    let waiting = st.q.waiting();
+    if st.q.running.is_empty() && waiting.is_empty() {
+        reply.out("no jobs running, queued or paused")?;
         return Ok(0);
     }
-    reply.out(&format!("{:>4}  {:<8} {:>7}  {}", "ID", "STATE", "TIME", "JOB"))?;
-    for r in &st.running {
-        let state = if r.drop_requested { "dropping" } else { "running" };
+    let row = |id: &dyn std::fmt::Display, state: &str, time: &str, res: &str, job: &str| {
+        format!("{:>4}  {:<9} {:>7}  {:<14}  {}", id, state, time, res, job)
+    };
+    reply.out(&row(&"ID", "STATE", "TIME", "RESOURCES", "JOB"))?;
+    for r in &st.q.running {
+        let state = match r.stop {
+            None => "running",
+            Some(StopRequest::Pause) => "pausing",
+            Some(_) => "dropping",
+        };
         let t = format_duration(r.started.elapsed().unwrap_or_default());
-        reply.out(&format!("{:>4}  {:<8} {:>7}  {}", r.job.id, state, t, jobs::describe(&r.job.args)))?;
+        let res = format!("{}, {}w", fmt_ram(r.alloc.ram), r.alloc.workers);
+        reply.out(&row(&r.job.id, state, &t, &res, &jobs::describe(&r.job.args)))?;
     }
-    for (i, j) in st.queue.iter().enumerate() {
-        reply.out(&format!("{:>4}  {:<8} {:>7}  {}", j.id, "queued", format!("#{}", i + 1), jobs::describe(&j.args)))?;
+    for (j, spot) in waiting {
+        let (state, pos) = match spot {
+            Spot::Queued(n) => ("queued", format!("#{}", n)),
+            Spot::Express => ("waiting", "next".to_string()),
+            Spot::Paused => ("paused", String::new()),
+        };
+        reply.out(&row(&j.id, state, &pos, "", &jobs::describe(&j.args)))?;
     }
     Ok(0)
 }
@@ -342,9 +455,14 @@ fn ls(d: &Daemon, reply: &mut Reply) -> io::Result<i32> {
 /// Prints a job's log, following it until the job ends if it's still running.
 fn log(d: &Daemon, reply: &mut Reply, key: &str) -> io::Result<i32> {
     if let Ok(id) = key.parse::<JobId>() {
-        let queued = d.lock().queue.iter().position(|j| j.id == id);
-        if let Some(pos) = queued {
-            reply.out(&format!("job {} is queued (#{} in line); its log starts when it runs", id, pos + 1))?;
+        let waiting = d.lock().q.waiting().iter().find(|(j, _)| j.id == id).map(|(_, s)| match s {
+            Spot::Queued(n) => format!("queued (#{} in line)", n),
+            Spot::Express => "waiting for room".to_string(),
+            Spot::Paused => "paused".to_string(),
+        });
+        // a paused job has a log from its earlier run, so fall through to it
+        if let Some(w) = waiting.filter(|w| w != "paused") {
+            reply.out(&format!("job {} is {}; its log starts when it runs", id, w))?;
             return Ok(0);
         }
     }
@@ -360,7 +478,7 @@ fn log(d: &Daemon, reply: &mut Reply, key: &str) -> io::Result<i32> {
     let mut buf = vec![0u8; 64 << 10];
     loop {
         // check before reading: the footer is written before the job leaves `running`
-        let live = d.lock().running.iter().any(|r| r.log == *path);
+        let live = d.lock().q.running.iter().any(|r| r.log == *path);
         loop {
             let n = f.read(&mut buf)?;
             if n == 0 { break; }
@@ -371,7 +489,8 @@ fn log(d: &Daemon, reply: &mut Reply, key: &str) -> io::Result<i32> {
     }
 }
 
-fn drop_jobs(d: &Daemon, reply: &mut Reply, ids: &[OsString]) -> io::Result<i32> {
+/// drop / pause / resume, each on a list of ids.
+fn for_each_id(d: &Arc<Daemon>, reply: &mut Reply, verb: &str, ids: &[OsString]) -> io::Result<i32> {
     let mut code = 0;
     for a in ids {
         let Ok(id) = a.to_string_lossy().parse::<JobId>() else {
@@ -380,56 +499,103 @@ fn drop_jobs(d: &Daemon, reply: &mut Reply, ids: &[OsString]) -> io::Result<i32>
             continue;
         };
         let mut st = d.lock();
-        if let Some(r) = st.running.iter_mut().find(|r| r.job.id == id) {
-            r.drop_requested = true;
-            drop(st);
-            reply.out(&format!("dropping job {}", id))?;
-        } else if let Some(pos) = st.queue.iter().position(|j| j.id == id) {
-            st.queue.remove(pos);
-            let _ = jobs::save_queue(&st.queue);
-            drop(st);
-            event(&format!("job {} removed from the queue", id));
-            reply.out(&format!("job {} removed from the queue", id))?;
-        } else {
-            reply.err(&format!("no running or queued job {}", id))?;
-            code = 1;
+        let running = st.q.running.iter_mut().find(|r| r.job.id == id);
+        let msg: Result<String, String> = match (verb, running) {
+            ("drop", Some(r)) => { r.stop = Some(StopRequest::Drop); Ok(format!("dropping job {}", id)) }
+            ("pause", Some(r)) => { r.stop = Some(StopRequest::Pause); Ok(format!("pausing job {}", id)) }
+            (_, Some(_)) => Err(format!("job {} is already running", id)), // resume
+            ("drop", None) => match st.q.remove_waiting(id) {
+                Some(_) => Ok(format!("job {} removed", id)),
+                None => Err(format!("no running, queued or paused job {}", id)),
+            },
+            ("pause", None) => {
+                if st.q.paused.iter().any(|j| j.id == id) {
+                    Err(format!("job {} is already paused", id))
+                } else if let Some(j) = st.q.remove_waiting(id) {
+                    st.q.paused.push(j);
+                    Ok(format!("job {} paused; it won't run until resumed", id))
+                } else {
+                    Err(format!("no running or queued job {}", id))
+                }
+            }
+            (_, None) => if st.q.resume(id) {
+                Ok(format!("job {} resumed; it runs as soon as there's room", id))
+            } else {
+                Err(format!("job {} isn't paused", id))
+            },
+        };
+        save(&st.q);
+        drop(st);
+        match msg {
+            Ok(m) => { event(&m); reply.out(&m)?; }
+            Err(m) => { reply.err(&m)?; code = 1; }
         }
     }
+    kick(d);
     Ok(code)
 }
 
-/// Stops starting jobs, then either waits for running ones or drops them. Dropped jobs
-/// go back to the front of the saved queue with -c, so the next start resumes them.
+fn edit(d: &Arc<Daemon>, reply: &mut Reply, rest: &[OsString]) -> io::Result<i32> {
+    let Some((id, tokens)) = rest.split_first() else {
+        reply.err("usage: tard server edit <job id> [<input>] [<output>] [options]")?;
+        return Ok(2);
+    };
+    let Ok(id) = id.to_string_lossy().parse::<JobId>() else {
+        reply.err(&format!("'{}' is not a job id", id.to_string_lossy()))?;
+        return Ok(2);
+    };
+    let mut st = d.lock();
+    if st.q.running.iter().any(|r| r.job.id == id) {
+        reply.err(&format!("job {} is running; pause it first, edit, then resume", id))?;
+        return Ok(1);
+    }
+    let Some(job) = st.q.waiting_mut(id) else {
+        reply.err(&format!("no queued or paused job {}", id))?;
+        return Ok(1);
+    };
+    match jobs::edit_args(&job.args, tokens) {
+        Ok(a) => {
+            job.args = a;
+            let m = format!("job {} is now: {}", id, jobs::describe(&job.args));
+            save(&st.q);
+            drop(st);
+            event(&m);
+            reply.out(&m)?;
+            kick(d);
+            Ok(0)
+        }
+        Err(e) => {
+            reply.err(&format!("Error: {}", e))?;
+            Ok(2)
+        }
+    }
+}
+
+/// Stops starting jobs, then either waits for running ones or stops them. Stopped jobs
+/// go back where they were in the saved queue, with -c, so the next start resumes them.
 fn stop(d: &Daemon, reply: &mut Reply, wait: bool) -> io::Result<()> {
     let mut st = d.lock();
     st.stopping = true;
-    if wait && !st.running.is_empty() {
-        let n = st.running.len();
+    if wait && !st.q.running.is_empty() {
+        let n = st.q.running.len();
         drop(st);
         reply.out(&format!("waiting for {} running job(s) to finish...", n))?;
         st = d.lock();
     } else if !wait {
-        let mut resumed: Vec<Job> = Vec::new();
-        for r in st.running.iter_mut() {
-            r.drop_requested = true;
-            let mut j = r.job.clone();
-            j.args.resume = true;
-            resumed.push(j);
+        for r in st.q.running.iter_mut() {
+            r.stop = Some(StopRequest::Requeue);
         }
-        for j in resumed.into_iter().rev() {
-            st.queue.push_front(j);
-        }
-        let _ = jobs::save_queue(&st.queue);
     }
     let st = if wait {
-        d.wake.wait_while(st, |st| !st.running.is_empty()).unwrap_or_else(|e| e.into_inner())
+        d.finished.wait_while(st, |st| !st.q.running.is_empty()).unwrap_or_else(|e| e.into_inner())
     } else {
-        d.wake.wait_timeout_while(st, STOP_TIMEOUT, |st| !st.running.is_empty())
+        d.finished.wait_timeout_while(st, STOP_TIMEOUT, |st| !st.q.running.is_empty())
             .unwrap_or_else(|e| e.into_inner()).0
     };
-    let saved = st.queue.len();
+    save(&st.q);
+    let saved = st.q.saved().len();
     if saved > 0 {
-        reply.out(&format!("server stopped; {} job(s) saved and will resume on next start", saved))
+        reply.out(&format!("server stopped; {} job(s) saved for the next start", saved))
     } else {
         reply.out("server stopped")
     }

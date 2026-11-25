@@ -13,7 +13,7 @@ const TEMPLATE: &str = r#"# tard configuration. Sizes: 512KB, 64MB, 4GB. Duratio
 [server]
 # localhost port the server listens on
 port = 8273
-# RAM shared by all running jobs; "auto" = half of the memory available when a job starts
+# RAM shared by all running jobs; "auto" = half of the memory available when the server starts
 max_ram = "auto"
 # worker threads shared by all running jobs; "auto" = number of CPUs
 max_workers = "auto"
@@ -25,9 +25,12 @@ max_run_time = "none"
 [jobs]
 # bounds for jobs submitted without -r/-n, which get a fair share of what's free
 min_ram = "10MB"
-max_ram = "1GB"
+max_ram = "256MB"
 min_workers = 1
 max_workers = 8
+# a job submitted with a leading -p (run now, alongside the queue) when there isn't room:
+# "wait" for room ahead of the queue, or "shrink" to start now with what's free
+express_when_full = "wait"
 
 [logs]
 # job logs kept in ~/.tard/server/logs (oldest are deleted first)
@@ -69,6 +72,14 @@ pub struct Jobs {
     pub max_ram: usize,
     pub min_workers: usize,
     pub max_workers: usize,
+    pub express_when_full: WhenFull,
+}
+
+#[derive(Debug, PartialEq, Clone, Copy, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WhenFull {
+    Wait,
+    Shrink,
 }
 
 #[derive(Debug, PartialEq, Deserialize)]
@@ -103,7 +114,7 @@ impl Default for Server {
 
 impl Default for Jobs {
     fn default() -> Self {
-        Self { min_ram: 10 << 20, max_ram: 1 << 30, min_workers: 1, max_workers: 8 }
+        Self { min_ram: 10 << 20, max_ram: 256 << 20, min_workers: 1, max_workers: 8, express_when_full: WhenFull::Wait }
     }
 }
 
@@ -270,6 +281,8 @@ mod tests {
         assert!(Config::parse("[server]\nmax_workers = \"many\"\n").is_err());
         assert!(Config::parse("[server]\nprot = 1\n").is_err()); // typo'd key
         assert!(Config::parse("[jobs]\nmin_ram = \"2GB\"\n").is_err()); // above max_ram
+        assert!(Config::parse("[jobs]\nexpress_when_full = \"later\"\n").is_err());
+        assert_eq!(Config::parse("[jobs]\nexpress_when_full = \"shrink\"\n").unwrap().jobs.express_when_full, WhenFull::Shrink);
     }
 
     #[test]

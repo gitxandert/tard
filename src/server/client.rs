@@ -42,8 +42,19 @@ pub fn main(args: Vec<OsString>) -> i32 {
             Ok(code) => code,
             Err(Unreachable) => log_offline(&args[1..]),
         },
-        Some("ping") | Some("ls") | Some("drop") => {
+        Some("ping") | Some("ls") | Some("drop") | Some("pause") | Some("resume") => {
             send_or(&config, &args, "server is not running (start it with: tard server start)")
+        }
+        Some("edit") => {
+            let mut req = args[..args.len().min(2)].to_vec();
+            match jobs::absolutize(args.into_iter().skip(2).collect()) {
+                Ok(t) => req.extend(t),
+                Err(e) => {
+                    eprintln!("Error: {}", e);
+                    return 2;
+                }
+            }
+            send_or(&config, &req, "server is not running (start it with: tard server start)")
         }
         // anything else is a job: tard server <input> <output> [options]
         Some(_) => submit(&config, args),
@@ -73,11 +84,17 @@ fn start(config: &Config) -> i32 {
     send_or(config, &[OsString::from("ping")], "server stopped right after starting")
 }
 
-/// Checks the job here, where relative paths mean something, then hands it to the
+/// Checks the jobs here, where relative paths mean something, then hands them to the
 /// server, starting the server first if needed.
 fn submit(config: &Config, args: Vec<OsString>) -> i32 {
-    let job = match jobs::parse_job(args) {
-        Ok(j) => j,
+    let parsed = jobs::split_chain(args).and_then(|(lane, groups)| {
+        let groups = groups.into_iter()
+            .map(|g| g.into_iter().map(jobs::parse_job).collect::<Result<Vec<_>, _>>())
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok((lane, groups))
+    });
+    let (lane, groups) = match parsed {
+        Ok(p) => p,
         Err(e) => {
             eprintln!("Error: {}", e);
             return 2;
@@ -89,7 +106,7 @@ fn submit(config: &Config, args: Vec<OsString>) -> i32 {
         }
     }
     let mut req = vec![OsString::from("submit")];
-    req.extend(job.to_argv());
+    req.extend(jobs::join_chain(lane, &groups));
     send_or(config, &req, "server stopped before the job was sent")
 }
 
@@ -221,14 +238,29 @@ Run tard jobs from a background server. Settings live in {}.
 Jobs:
   <INPUT> <OUTPUT_DIR> [OPTIONS]
              Queue a job, starting the server if needed. Takes the same options
-             as tard itself (-a, -x, -c, -v, -r, -n); see tard -h
-  ls         List running and queued jobs
+             as tard itself (-a, -x, -c, -v, -r, -n); see tard -h. Without -r/-n
+             the server sizes the job from what's free
+  JOB -q JOB Run the second job after the first (and so on). If a job fails,
+             the rest of its chain is skipped
+  JOB -p JOB Run both jobs side by side; -p binds tighter than -q, so
+             `A -p B -q C` runs A and B together, then C
+  -p JOB ... Run now, alongside whatever is running, instead of joining the
+             queue (waits for room unless [jobs] express_when_full = \"shrink\")
+  ls         List running, queued and paused jobs
   log <ID|NAME>
              Print a job's log, by job id or input file name (latest match),
              following it while the job runs
   drop <ID>...
-             Stop a running job or remove a queued one. A dropped archive can
+             Stop a running job or remove a waiting one. A dropped archive can
              be resumed with -c
+  pause <ID>...
+             Stop a running job (or hold a queued one) until it's resumed
+  resume <ID>...
+             Continue paused jobs (with -c) as soon as there's room
+  edit <ID> [<INPUT>] [<OUTPUT_DIR>] [OPTIONS]
+             Change a queued or paused job: options given replace the job's,
+             -r auto / -n auto let the server decide, paths replace its input
+             (then output)
 
 Server:
   start      Start the server in the background (also: bare `tard server`)
