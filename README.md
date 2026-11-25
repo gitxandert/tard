@@ -176,8 +176,8 @@ top-level command (`tard server schedule drop 25` is `tard server drop 25`).
 | `pause NAME\|ID...` | Stop it from running | Like `pause` |
 | `resume NAME\|ID...` | Let it run again | Like `resume` |
 
-The flag spellings `-n`, `-e`, `-r` and `-l` also work. Schedule names
-can't be all digits, since those are job ids, or a command word.
+Schedule names can't be all digits, since those are job ids, or a command
+word.
 
 ## Logs
 

@@ -132,23 +132,23 @@ fn submit(config: &Config, args: Vec<OsString>) -> i32 {
 }
 
 /// `tard server schedule ...`. The flags mirror the top-level commands and also take
-/// job ids, so `schedule -r 12` is `drop 12` and `schedule -l 12` is `log 12`.
+/// job ids, so `schedule drop 12` is `drop 12` and `schedule log 12` is `log 12`.
 fn schedule(config: &Config, args: &[OsString]) -> i32 {
-    // the top-level job verbs work here too, with flag spellings as aliases
+    // the top-level job verbs work here too
     let verb = match args.first().and_then(|a| a.to_str()) {
         None | Some("ls") => "ls",
         Some("-h" | "--help") => {
             print_schedule_help();
             return 0;
         }
-        Some("new" | "-n" | "--new") => "new",
-        Some("edit" | "-e" | "--edit") => "edit",
-        Some("drop" | "remove" | "-r" | "--remove") => "drop",
-        Some("log" | "-l" | "--log") => "log",
+        Some("new") => "new",
+        Some("edit") => "edit",
+        Some("drop") => "drop",
+        Some("log") => "log",
         Some("pause") => "pause",
         Some("resume") => "resume",
         Some(f) if f.starts_with('-') => {
-            eprintln!("unknown option {} (see tard server schedule -h)", f);
+            eprintln!("schedule takes commands, not options: {} (see tard server schedule -h)", f);
             return 2;
         }
         Some(_) => "show",
@@ -262,8 +262,6 @@ log, pause and resume act on that job, as `tard server <command> <id>` would.
   pause NAME|ID...     Stop a scheduled job from running until it's resumed
   resume NAME|ID...    Let it run again; a run that came due while paused
                        runs once right away
-
-Flag spellings also work: -n/--new, -e/--edit, -r/--remove, -l/--log.
 
 Repeats: every 30m / 6h / 1d / 2w, or days and a time: mon,thu 03:00,
 daily 03:00, weekdays 09:30, weekends 10:00. Times are local. Runs missed while

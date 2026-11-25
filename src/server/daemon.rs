@@ -731,7 +731,7 @@ fn scheduler(d: Arc<Daemon>) {
 fn schedule_list(d: &Daemon, reply: &mut Reply) -> io::Result<i32> {
     let st = d.lock();
     if st.schedules.is_empty() {
-        reply.out("no scheduled jobs (add one with: tard server schedule -n <name>)")?;
+        reply.out("no scheduled jobs (add one with: tard server schedule new <name>)")?;
         return Ok(0);
     }
     let row = |a: &str, b: &str, c: &str, e: &str| format!("{:<20} {:<17} {:<32} {}", a, b, c, e);
@@ -833,7 +833,7 @@ fn schedule_put(d: &Daemon, reply: &mut Reply, replace: bool, rest: &[OsString])
     let existing = st.schedules.iter().position(|s| s.name == new.name);
     match (existing, replace) {
         (Some(_), false) => {
-            reply.err(&format!("a scheduled job named '{}' already exists (edit it with -e)", new.name))?;
+            reply.err(&format!("a scheduled job named '{}' already exists (change it with: tard server schedule edit {})", new.name, new.name))?;
             return Ok(1);
         }
         (None, true) => {

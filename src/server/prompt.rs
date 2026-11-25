@@ -1,4 +1,4 @@
-// Interactive prompts for `tard server schedule -n/-e`. They run in the client (where
+// Interactive prompts for `tard server schedule new/edit`. They run in the client (where
 // relative paths mean something) and produce the server's schedule-add/-set request.
 use std::{
     ffi::OsString,
