@@ -24,6 +24,9 @@ pub struct Schedule {
     pub next: Option<String>,
     #[serde(default)]
     pub history: Vec<Run>,
+    /// paused schedules don't run; runs that come due wait for resume
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub paused: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -74,6 +77,9 @@ pub fn check_name(name: &str) -> Result<(), String> {
     }
     if name.chars().all(|c| c.is_ascii_digit()) {
         return Err("a schedule name can't be just digits (those are job ids)".into());
+    }
+    if matches!(name, "ls" | "new" | "edit" | "drop" | "remove" | "log" | "pause" | "resume") {
+        return Err(format!("'{}' is a schedule command, so it can't be a name", name));
     }
     Ok(())
 }
@@ -249,6 +255,11 @@ impl Schedule {
 
     /// "once", "every 1d, forever", "every 6h, 3 of 5 runs done"
     pub fn regularity(&self) -> String {
+        let r = self.regularity_unpaused();
+        if self.paused { format!("{} (paused)", r) } else { r }
+    }
+
+    fn regularity_unpaused(&self) -> String {
         match self.runs {
             _ if self.repeat == "once" => "once".into(),
             None => format!("{}, forever", self.repeat),
@@ -388,7 +399,7 @@ mod tests {
     fn advance_counts_runs() {
         let mut s = Schedule {
             name: "n".into(), args: vec![], repeat: "every 1d".into(), runs: Some(2),
-            done: 0, next: None, history: vec![],
+            done: 0, next: None, history: vec![], paused: false,
         };
         let t = at("2026-11-24T03:00:00Z");
         s.advance(&t, &t);
@@ -405,7 +416,7 @@ mod tests {
     fn file_round_trip() {
         let s = Schedule {
             name: "photos".into(), args: vec!["-a".into(), "/a b".into()], repeat: "once".into(),
-            runs: Some(1), done: 0, next: Some(at("2026-11-24T03:00:00Z").to_string()), history: vec![],
+            runs: Some(1), done: 0, next: Some(at("2026-11-24T03:00:00Z").to_string()), history: vec![], paused: false,
         };
         let text = toml::to_string(&ScheduleFile { schedules: vec![s.clone()] }).unwrap();
         assert_eq!(toml::from_str::<ScheduleFile>(&text).unwrap().schedules, vec![s]);
@@ -417,6 +428,7 @@ mod tests {
         assert!(check_name("123").is_err());
         assert!(check_name("-x").is_err());
         assert!(check_name("a b").is_err());
+        assert!(check_name("drop").is_err());
         let words = vec!["-a".to_string(), "/my photos".to_string(), "it's".to_string()];
         assert_eq!(shell_split(&shell_join(&words)).unwrap(), words);
         assert_eq!(shell_split(r#"a "b c" d\ e"#).unwrap(), vec!["a", "b c", "d e"]);

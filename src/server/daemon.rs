@@ -364,13 +364,14 @@ fn handle(d: &Arc<Daemon>, stream: TcpStream) -> io::Result<()> {
             _ => { reply.err("usage: tard server schedule [<name>]")?; 2 }
         },
         "schedule-add" | "schedule-set" => schedule_put(d, &mut reply, cmd == "schedule-set", rest)?,
-        "schedule-get" | "schedule-rm" | "schedule-log" => match rest {
+        "schedule-get" | "schedule-rm" | "schedule-drop" | "schedule-log" | "schedule-pause" | "schedule-resume" => match rest {
             [name] => {
                 let name = name.to_string_lossy();
                 match cmd {
                     "schedule-get" => schedule_get(d, &mut reply, &name)?,
-                    "schedule-rm" => schedule_rm(d, &mut reply, &name)?,
-                    _ => schedule_log(d, &mut reply, &name)?,
+                    "schedule-rm" | "schedule-drop" => schedule_rm(d, &mut reply, &name)?,
+                    "schedule-log" => schedule_log(d, &mut reply, &name)?,
+                    _ => schedule_pause(d, &mut reply, &name, cmd == "schedule-pause")?,
                 }
             }
             _ => { reply.err(&format!("usage: {} <name>", cmd))?; 2 }
@@ -674,6 +675,7 @@ fn scheduler(d: Arc<Daemon>) {
             let State { schedules, q, next_id, .. } = &mut *st;
             let mut changed = false;
             for s in schedules.iter_mut() {
+                if s.paused { continue; }
                 let Some(due) = s.next_time().filter(|t| *t <= now) else { continue };
                 changed = true;
                 let at = schedule::show(&now);
@@ -818,7 +820,7 @@ fn schedule_put(d: &Daemon, reply: &mut Reply, replace: bool, rest: &[OsString])
         let args = args.to_argv().into_iter()
             .map(|a| a.into_string().map_err(|_| "paths that aren't valid UTF-8 can't be scheduled".to_string()))
             .collect::<Result<Vec<_>, _>>()?;
-        Ok(Schedule { name, args, repeat: repeat.to_text(), runs, done: 0, next: Some(first.to_string()), history: Vec::new() })
+        Ok(Schedule { name, args, repeat: repeat.to_text(), runs, done: 0, next: Some(first.to_string()), history: Vec::new(), paused: false })
     })();
     let mut new = match parsed {
         Ok(s) => s,
@@ -842,6 +844,7 @@ fn schedule_put(d: &Daemon, reply: &mut Reply, replace: bool, rest: &[OsString])
             let old = st.schedules.remove(i);
             new.done = old.done;
             new.history = old.history;
+            new.paused = old.paused;
             if new.runs.is_some_and(|n| new.done >= n) {
                 new.next = None;
             }
@@ -879,6 +882,34 @@ fn schedule_rm(d: &Daemon, reply: &mut Reply, name: &str) -> io::Result<i32> {
     drop(st);
     event(&format!("schedule {} removed", name));
     reply.out(&format!("scheduled job '{}' removed (its logs are kept in {})", name, jobs::scheduled_log_dir(name).display()))?;
+    Ok(0)
+}
+
+fn schedule_pause(d: &Daemon, reply: &mut Reply, name: &str, pause: bool) -> io::Result<i32> {
+    let mut st = d.lock();
+    let Some(s) = st.schedules.iter_mut().find(|s| s.name == name) else {
+        reply.err(&format!("no scheduled job '{}'", name))?;
+        return Ok(1);
+    };
+    if s.paused == pause {
+        reply.err(&format!("scheduled job '{}' is already {}", name, if pause { "paused" } else { "running" }))?;
+        return Ok(1);
+    }
+    s.paused = pause;
+    let msg = if pause {
+        format!("scheduled job '{}' paused; it won't run until resumed", name)
+    } else {
+        match s.next_time() {
+            Some(t) if t <= Zdt::now() => format!("scheduled job '{}' resumed; the run that came due while paused starts now", name),
+            Some(t) => format!("scheduled job '{}' resumed; next run {}", name, schedule::show(&t)),
+            None => format!("scheduled job '{}' resumed, but it has no runs left", name),
+        }
+    };
+    save_schedules(&st.schedules);
+    drop(st);
+    d.sched_wake.notify_all();
+    event(&msg);
+    reply.out(&msg)?;
     Ok(0)
 }
 

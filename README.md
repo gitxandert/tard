@@ -143,14 +143,15 @@ A job running longer than `max_run_time` is dropped.
 ### Scheduling
 
 ```sh
-tard server schedule -n nightly     # create one, step by step
-tard server schedule                # list scheduled jobs
+tard server schedule new nightly    # create one, step by step
+tard server schedule                # list scheduled jobs (or: schedule ls)
 tard server schedule nightly        # details and recent runs
+tard server schedule pause nightly  # stop it from running until resumed
 ```
 
-`-n` asks for the job's arguments (checked like a submission), how many runs
-(`once`, a number, or `series` to repeat forever), how often, and when to
-start.
+`new` asks for the job's arguments (checked like a submission), how many
+runs (`once`, a number, or `series` to repeat forever), how often, and when
+to start.
 
 - **How often:** `every 30m`, `every 6h`, `every 1d` or `every 2w`, or days
   and a time: `mon,thu 03:00`, `daily 03:00`, `weekdays 09:30`,
@@ -158,15 +159,25 @@ start.
 - **Starting:** scheduled runs start on time alongside the queue, waiting
   only for RAM and workers.
 - **Overlap:** if a run's previous run is still going, that run is skipped.
-- **Downtime:** runs missed while the server was down are made up once when
-  it starts.
+- **Downtime:** runs missed while the server was down, or while the
+  schedule was paused, are made up once.
 
-| Option | Does |
-|---|---|
-| `-n`, `--new NAME` | Create a scheduled job |
-| `-e`, `--edit NAME\|ID` | Edit a scheduled job (same prompts, current values as defaults), or a queued job by id |
-| `-r`, `--remove NAME\|ID...` | Remove scheduled jobs, or drop jobs by id |
-| `-l`, `--log NAME\|ID` | The latest run's log, or a job's log by id |
+The job commands work under `schedule` too. Given a name they act on the
+scheduled job; given a job id they act on that job, exactly like the
+top-level command (`tard server schedule drop 25` is `tard server drop 25`).
+
+| Command | With a NAME | With a job ID |
+|---|---|---|
+| `ls` | List scheduled jobs | |
+| `new NAME` | Create a scheduled job | |
+| `edit NAME\|ID` | Same prompts, current values as defaults | Like `edit` |
+| `drop NAME\|ID...` | Remove it (a run already going finishes) | Like `drop` |
+| `log NAME\|ID` | The latest run's log | Like `log` |
+| `pause NAME\|ID...` | Stop it from running | Like `pause` |
+| `resume NAME\|ID...` | Let it run again | Like `resume` |
+
+The flag spellings `-n`, `-e`, `-r` and `-l` also work. Schedule names
+can't be all digits, since those are job ids, or a command word.
 
 ## Logs
 

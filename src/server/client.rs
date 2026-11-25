@@ -134,44 +134,68 @@ fn submit(config: &Config, args: Vec<OsString>) -> i32 {
 /// `tard server schedule ...`. The flags mirror the top-level commands and also take
 /// job ids, so `schedule -r 12` is `drop 12` and `schedule -l 12` is `log 12`.
 fn schedule(config: &Config, args: &[OsString]) -> i32 {
-    let flag = args.first().and_then(|a| a.to_str());
-    if matches!(flag, Some("-h" | "--help")) {
-        print_schedule_help();
-        return 0;
+    // the top-level job verbs work here too, with flag spellings as aliases
+    let verb = match args.first().and_then(|a| a.to_str()) {
+        None | Some("ls") => "ls",
+        Some("-h" | "--help") => {
+            print_schedule_help();
+            return 0;
+        }
+        Some("new" | "-n" | "--new") => "new",
+        Some("edit" | "-e" | "--edit") => "edit",
+        Some("drop" | "remove" | "-r" | "--remove") => "drop",
+        Some("log" | "-l" | "--log") => "log",
+        Some("pause") => "pause",
+        Some("resume") => "resume",
+        Some(f) if f.starts_with('-') => {
+            eprintln!("unknown option {} (see tard server schedule -h)", f);
+            return 2;
+        }
+        Some(_) => "show",
+    };
+    let targets: Vec<String> = match verb {
+        "ls" => Vec::new(),
+        "show" => vec![args[0].to_string_lossy().into_owned()],
+        _ => args[1..].iter().map(|a| a.to_string_lossy().into_owned()).collect(),
+    };
+    if verb != "ls" && targets.is_empty() {
+        eprintln!("{} needs a scheduled job name (or a job id); see tard server schedule -h", verb);
+        return 2;
     }
     if !is_up(config) {
         if let Err(code) = launch(config) {
             return code;
         }
     }
-    let target = args.get(1).map(|a| a.to_string_lossy().into_owned());
     let is_id = |t: &str| t.chars().all(|c| c.is_ascii_digit());
     let os = |v: &[&str]| v.iter().map(OsString::from).collect::<Vec<_>>();
     let down = "server stopped unexpectedly";
-    match (flag, target.as_deref()) {
-        (None, _) => send_or(config, &os(&["schedule"]), down),
-        (Some("-n" | "--new"), Some(name)) => {
-            if let Err(e) = crate::server::schedule::check_name(name) {
+    let first = targets.first().map(String::as_str).unwrap_or("");
+    match verb {
+        "ls" => send_or(config, &os(&["schedule"]), down),
+        "show" => send_or(config, &os(&["schedule", first]), down),
+        "new" => {
+            if let Err(e) = crate::server::schedule::check_name(first) {
                 eprintln!("Error: {}", e);
                 return 2;
             }
-            if matches!(request(config, &os(&["schedule-get", name]), &mut io::sink(), &mut io::sink()), Ok(0)) {
-                eprintln!("a scheduled job named '{}' already exists (edit it with: tard server schedule -e {})", name, name);
+            if matches!(request(config, &os(&["schedule-get", first]), &mut io::sink(), &mut io::sink()), Ok(0)) {
+                eprintln!("a scheduled job named '{}' already exists (edit it with: tard server schedule edit {})", first, first);
                 return 1;
             }
-            run_prompts(config, name, None)
+            run_prompts(config, first, None)
         }
-        (Some("-e" | "--edit"), Some(t)) if is_id(t) => {
-            let mut req = vec![OsString::from("edit"), t.into()];
+        "edit" if is_id(first) => {
+            let mut req = vec![OsString::from("edit"), first.into()];
             match jobs::absolutize(args[2..].to_vec()) {
                 Ok(rest) => req.extend(rest),
                 Err(e) => { eprintln!("Error: {}", e); return 2; }
             }
             send_or(config, &req, down)
         }
-        (Some("-e" | "--edit"), Some(name)) => {
+        "edit" => {
             let mut out = Vec::new();
-            match request(config, &os(&["schedule-get", name]), &mut out, &mut io::stderr()) {
+            match request(config, &os(&["schedule-get", first]), &mut out, &mut io::stderr()) {
                 Ok(0) => (),
                 Ok(code) => return code,
                 Err(Unreachable) => { eprintln!("{}", down); return 1; }
@@ -180,30 +204,25 @@ fn schedule(config: &Config, args: &[OsString]) -> i32 {
                 eprintln!("Error: unexpected reply from server");
                 return 1;
             };
-            run_prompts(config, name, Some(&cur))
+            run_prompts(config, first, Some(&cur))
         }
-        (Some("-r" | "--remove"), Some(_)) => {
+        "log" => {
+            let v = if is_id(first) { "log" } else { "schedule-log" };
+            send_or(config, &os(&[v, first]), down)
+        }
+        // drop / pause / resume: ids go to the job commands, names to the schedule
+        _ => {
             let mut code = 0;
-            for t in &args[1..] {
-                let t = t.to_string_lossy();
-                let req = if is_id(&t) { os(&["drop", &t]) } else { os(&["schedule-rm", &t]) };
+            for t in &targets {
+                let req = if is_id(t) {
+                    os(&[verb, t])
+                } else {
+                    os(&[&format!("schedule-{}", verb), t])
+                };
                 code = code.max(send_or(config, &req, down));
             }
             code
         }
-        (Some("-l" | "--log"), Some(t)) => {
-            let verb = if is_id(t) { "log" } else { "schedule-log" };
-            send_or(config, &os(&[verb, t]), down)
-        }
-        (Some("-n" | "--new" | "-e" | "--edit" | "-r" | "--remove" | "-l" | "--log"), None) => {
-            eprintln!("{} needs a scheduled job name (or a job id); see tard server schedule -h", flag.unwrap());
-            2
-        }
-        (Some(f), _) if f.starts_with('-') => {
-            eprintln!("unknown option {} (see tard server schedule -h)", f);
-            2
-        }
-        (Some(name), _) => send_or(config, &os(&["schedule", name]), down),
     }
 }
 
@@ -223,22 +242,28 @@ fn run_prompts(config: &Config, name: &str, current: Option<&prompt::Current>) -
 
 fn print_schedule_help() {
     println!(
-"Usage: tard server schedule [OPTION] [NAME | JOB ID]
+"Usage: tard server schedule [COMMAND] [NAME | JOB ID]...
 
 Run jobs at set times. Scheduled runs start at their time, alongside the queue
 (waiting for room if needed), and log to {}/<NAME>/.
+The job commands work here too: given a job id instead of a name, edit, drop,
+log, pause and resume act on that job, as `tard server <command> <id>` would.
 
-  schedule                 List scheduled jobs
-  schedule NAME            Show a scheduled job: its arguments, how often it runs,
-                           its next run, and its last runs with their status
-  -n, --new NAME           Create a scheduled job, step by step: the job's
-                           arguments, then how many runs (once, N, or series),
-                           then when it first runs
-  -e, --edit NAME|ID       Change a scheduled job (same steps, current values as
-                           defaults), or a queued job by id, like `edit`
-  -r, --remove NAME|ID...  Remove scheduled jobs, or drop jobs by id, like `drop`
-  -l, --log NAME|ID        Print the latest run's log (following it while it
-                           runs), or a job's log by id, like `log`
+  ls                   List scheduled jobs (also: bare `schedule`)
+  NAME                 Show a scheduled job: its arguments, how often it runs,
+                       its next run, and its last runs with their status
+  new NAME             Create a scheduled job, step by step: the job's
+                       arguments, then how many runs (once, N, or series),
+                       then when it first runs
+  edit NAME|ID         Change a scheduled job (same steps, current values as
+                       defaults)
+  drop NAME|ID...      Remove scheduled jobs (runs already going finish)
+  log NAME|ID          Print the latest run's log, following it while it runs
+  pause NAME|ID...     Stop a scheduled job from running until it's resumed
+  resume NAME|ID...    Let it run again; a run that came due while paused
+                       runs once right away
+
+Flag spellings also work: -n/--new, -e/--edit, -r/--remove, -l/--log.
 
 Repeats: every 30m / 6h / 1d / 2w, or days and a time: mon,thu 03:00,
 daily 03:00, weekdays 09:30, weekends 10:00. Times are local. Runs missed while

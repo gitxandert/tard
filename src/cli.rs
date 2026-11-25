@@ -5,7 +5,7 @@ use std::{
 };
 use crate::archive::archive::archive;
 use crate::extract::extract::extract;
-use crate::utils::formatting::{format_size, parse_size};
+use crate::utils::formatting::parse_size;
 use crate::utils::logger::format_filename_time;
 
 pub fn route_args() {
@@ -181,26 +181,34 @@ fn print_help() {
     let d = Args::new();
     println!(
 "Usage: tard [OPTIONS] <INPUT> <OUTPUT_DIR>
+       tard server [COMMAND | JOB]
 
-Archive a directory into <OUTPUT_DIR>/<name>.tard, or extract a .tard file.
+Archive a directory into <OUTPUT_DIR>/<name>.tard, or extract a .tard file
+into <OUTPUT_DIR>.
 
 Options:
-  -a, --archive              Archive INPUT directory (default)
-  -x, --extract              Extract INPUT .tard file
-  -c, --continue             Resume an interrupted run (default: {})
-  -r, --ram <SIZE>           Max RAM for buffers, e.g. 512KB, 64MB, 1GB (default: {})
-  -n, --num_workers <N>      Number of worker threads (default: {})
-  -v, --verbose              Also print each file's path and size, plus progress
-                             notes (default: {})
+  -a, --archive              Archive the INPUT directory (the default)
+  -x, --extract              Extract the INPUT .tard file
+  -c, --continue             Resume an interrupted run: archive appends what's
+                             missing to the existing .tard; extract skips files
+                             already written in full and rewrites the rest
+  -r, --ram <SIZE>           RAM for buffers, shared by the workers, e.g. 512KB,
+                             64MB, 1GB (default: {})
+  -n, --num_workers <N>      Worker threads (default: {})
+  -v, --verbose              Also print each file's path and size, plus
+                             progress notes
   -l, --log <PATH>           Where the per-file CSV log goes: a directory, for
                              <PATH>/<name>_<datetime>.log, or a file path
-                             (default: {}, set with
-                             [logs] files in {})
-  -h, --help                 Show this help",
-        d.resume,
-        format_size(d.max_ram as u64),
+                             (default: {}; set [logs] files in
+                             {})
+  -h, --help                 Show this help
+
+Server:
+  tard server ...            Queue jobs, run them in parallel within RAM and CPU
+                             limits, schedule them, and watch them live; see
+                             tard server -h",
+        size_arg(d.max_ram),
         d.num_workers,
-        d.verbose,
         crate::config::files_log_dir().display(),
         crate::config::config_path().display(),
     );
