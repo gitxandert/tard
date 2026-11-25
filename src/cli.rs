@@ -7,6 +7,11 @@ use crate::extract::extract::extract;
 use crate::utils::formatting::{format_size, parse_size};
 
 pub fn route_args() {
+    let mut raw = env::args_os().skip(1);
+    if raw.next().is_some_and(|a| a == "server") {
+        std::process::exit(crate::server::client::main(raw.collect()));
+    }
+
     let args = match parse_args() {
         Ok(a) => a,
         Err(e) => {

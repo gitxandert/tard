@@ -181,7 +181,7 @@ fn civil(t: SystemTime) -> (i64, u32, u32, u32, u32, u32) {
 }
 
 /// e.g. 2026-11-23T19:18:05Z
-fn format_iso_time(t: SystemTime) -> String {
+pub fn format_iso_time(t: SystemTime) -> String {
     let (y, mo, d, h, mi, s) = civil(t);
     format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z", y, mo, d, h, mi, s)
 }
