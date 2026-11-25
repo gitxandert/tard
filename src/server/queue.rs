@@ -10,7 +10,6 @@ use std::{
     path::PathBuf,
     time::SystemTime,
 };
-use crate::cli::Cmd;
 use crate::server::jobs::{Job, JobId};
 
 pub type ChainId = u64;
@@ -276,15 +275,10 @@ impl Queue {
 /// server's total.
 pub fn allocate(job: &Job, free: Res, share: usize, lim: &Limits, shrink: bool) -> Option<Res> {
     let a = &job.args;
-    let want = if a.cmd == Cmd::Extract {
-        // extract ignores -r/-n: one reader, one writer
-        Res { ram: lim.min.ram, workers: 1 }
-    } else {
-        let share = share.max(1);
-        Res {
-            ram: if a.ram_given { a.max_ram.min(lim.total.ram) } else { (free.ram / share).clamp(lim.min.ram, lim.max.ram) },
-            workers: if a.workers_given { a.num_workers.min(lim.total.workers) } else { (free.workers / share).clamp(lim.min.workers, lim.max.workers) },
-        }
+    let share = share.max(1);
+    let want = Res {
+        ram: if a.ram_given { a.max_ram.min(lim.total.ram) } else { (free.ram / share).clamp(lim.min.ram, lim.max.ram) },
+        workers: if a.workers_given { a.num_workers.min(lim.total.workers) } else { (free.workers / share).clamp(lim.min.workers, lim.max.workers) },
     };
     if want.ram <= free.ram && want.workers <= free.workers {
         Some(want)

@@ -10,7 +10,6 @@ use std::{
     thread,
     time::{Duration, SystemTime},
 };
-use crate::cli::Cmd;
 use crate::config::{Config, WhenFull};
 use crate::server::jobs::{self, Job, JobId};
 use crate::server::proto::{self, Frame};
@@ -190,12 +189,10 @@ fn kick(d: &Arc<Daemon>) -> Vec<JobId> {
 
 fn spawn_job(d: &Daemon, job: &Job, alloc: Res, log: &Path) -> io::Result<Child> {
     let mut args = job.args.clone();
-    if args.cmd == Cmd::Archive {
-        args.max_ram = alloc.ram;
-        args.num_workers = alloc.workers;
-        args.ram_given = true;
-        args.workers_given = true;
-    }
+    args.max_ram = alloc.ram;
+    args.num_workers = alloc.workers;
+    args.ram_given = true;
+    args.workers_given = true;
     let argv = args.to_argv();
     let mut f = create_private_file(log)?;
     writeln!(f, "job {}: {}", job.id, jobs::describe(&job.args))?;
