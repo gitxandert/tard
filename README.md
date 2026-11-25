@@ -125,7 +125,7 @@ The server shares `max_ram` and `max_workers` across at most
 | `drop <ID>...` | Stop a running job, or remove a waiting one |
 | `pause <ID>...` | Stop a running job, or hold a queued one |
 | `resume <ID>...` | Continue paused jobs (with `-c`), ahead of the queue |
-| `drop queued` | Empty the queue. `drop`, `pause` and `resume` take `queued`, `paused`, `running` or `all` in place of ids |
+| `drop all` | Full stop: stop every running job and remove everything queued or paused. `drop`, `pause` and `resume` also take `paused`, `running` or `all` in place of ids |
 | `edit <ID> [IN] [OUT] [OPTIONS]` | Change a queued or paused job. Options given replace the job's; `-r auto` and `-n auto` let the server decide; `-l default` restores the default log location |
 | `watch` | Take over the terminal with a live view of jobs and server output; `q` gives it back |
 
@@ -177,7 +177,7 @@ top-level command (`tard server schedule drop 25` is `tard server drop 25`).
 | `pause NAME\|ID...` | Stop it from running | Like `pause` |
 | `resume NAME\|ID...` | Let it run again | Like `resume` |
 
-`drop queued` and the other group words work here too. Schedule names can't
+`drop all` and the other group words work here too. Schedule names can't
 be all digits, since those are job ids, or a command or group word.
 
 ## Logs

@@ -553,11 +553,10 @@ fn for_each_id(d: &Arc<Daemon>, reply: &mut Reply, verb: &str, ids: &[OsString])
             targets.push(id);
             continue;
         }
-        // group words: queued (main queue and jobs waiting for room), paused, running, all
+        // group words: paused, running, all (everything running, queued or paused)
         let st = d.lock();
         let waiting = st.q.waiting();
         let group: Option<Vec<JobId>> = match a.as_ref() {
-            "queued" => Some(waiting.iter().filter(|(_, s)| !matches!(s, Spot::Paused)).map(|(j, _)| j.id).collect()),
             "paused" => Some(waiting.iter().filter(|(_, s)| matches!(s, Spot::Paused)).map(|(j, _)| j.id).collect()),
             "running" => Some(st.q.running.iter().map(|r| r.job.id).collect()),
             "all" => Some(st.q.running.iter().map(|r| r.job.id).chain(waiting.iter().map(|(j, _)| j.id)).collect()),
@@ -568,7 +567,7 @@ fn for_each_id(d: &Arc<Daemon>, reply: &mut Reply, verb: &str, ids: &[OsString])
             Some(g) if g.is_empty() => reply.out(&format!("no {} jobs", if a == "all" { "running, queued or paused" } else { a.as_ref() }))?,
             Some(g) => targets.extend(g),
             None => {
-                reply.err(&format!("'{}' is not a job id (or queued, paused, running, all)", a))?;
+                reply.err(&format!("'{}' is not a job id (or paused, running, all)", a))?;
                 code = 2;
             }
         }

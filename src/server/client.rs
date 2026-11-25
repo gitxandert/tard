@@ -214,7 +214,7 @@ fn schedule(config: &Config, args: &[OsString]) -> i32 {
         _ => {
             let mut code = 0;
             for t in &targets {
-                let req = if is_id(t) || matches!(t.as_str(), "queued" | "paused" | "running" | "all") {
+                let req = if is_id(t) || matches!(t.as_str(), "paused" | "running" | "all") {
                     os(&[verb, t])
                 } else {
                     os(&[&format!("schedule-{}", verb), t])
@@ -258,7 +258,7 @@ log, pause and resume act on that job, as `tard server <command> <id>` would.
   edit NAME|ID         Change a scheduled job (same steps, current values as
                        defaults)
   drop NAME|ID...      Remove scheduled jobs (runs already going finish);
-                       queued, paused, running and all act on jobs, as with
+                       paused, running and all act on jobs, as with
                        `tard server drop`
   log NAME|ID          Print the latest run's log, following it while it runs
   pause NAME|ID...     Stop a scheduled job from running until it's resumed
@@ -422,8 +422,8 @@ Jobs:
              Stop a running job (or hold a queued one) until it's resumed
   resume <ID>...
              Continue paused jobs (with -c) as soon as there's room
-             drop, pause and resume also take queued, paused, running or all
-             in place of ids, e.g. `drop queued` empties the queue
+             drop, pause and resume also take paused, running or all in place
+             of ids; `drop all` stops everything running, queued or paused
   edit <ID> [<INPUT>] [<OUTPUT_DIR>] [OPTIONS]
              Change a queued or paused job: options given replace the job's,
              -r auto / -n auto let the server decide, -l default restores the
