@@ -4,7 +4,7 @@ use std::{
 };
 use crate::archive::archive::archive;
 use crate::extract::extract::extract;
-use crate::utils::formatting::format_size;
+use crate::utils::formatting::{format_size, parse_size};
 
 pub fn route_args() {
     let args = match parse_args() {
@@ -56,7 +56,7 @@ fn parse_args() -> Result<Args, String> {
             "-v" | "--verbose" => args_struct.verbose = true,
             "-r" | "--ram" => {
                 if let Some(a) = args.next() {
-                    args_struct.max_ram = match parse_ram_arg(&a) {
+                    args_struct.max_ram = match parse_size(&a) {
                         Ok(ram) => ram,
                         Err(e) => return Err(e),
                     }
@@ -128,29 +128,6 @@ Options:
         d.verbose,
     );
 }
-
-fn parse_ram_arg(ram: &str) -> Result<usize, String> {
-    let suffixes = [
-        ("TB", 1usize << 40),
-        ("GB", 1usize << 30),
-        ("MB", 1usize << 20),
-        ("KB", 1usize << 10),
-        ("B", 1usize),
-    ];
-
-    for (suffix, multiplier) in &suffixes {
-        if let Some(num_str) = ram.strip_suffix(suffix) {
-            return num_str
-                .parse::<usize>()
-                .map(|n| n * multiplier)
-                .map_err(|_| "cannot coerce to decimal".to_string());
-        }
-    }
-
-    ram.parse::<usize>()
-        .map_err(|_| "invalid byte signifier".to_string())
-}
-
 
 // enums, structs
 //
