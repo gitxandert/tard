@@ -1,7 +1,6 @@
 use std::{
     io,
     path::{Path, PathBuf},
-    os::unix::ffi::{OsStrExt, OsStringExt},
     thread::{self, JoinHandle},
     fs::{self, File, OpenOptions},
     collections::HashSet,
@@ -10,6 +9,7 @@ use std::{
 use crate::cli::Args;
 use crate::utils::formatting::format_size;
 use crate::utils::logger::{LogEntry, LogMsg, LogTx, Logger};
+use crate::utils::path::{bytes_to_path, path_to_bytes};
 
 pub fn archive(args: Args) -> io::Result<()> {
     // validate args (errors here are returned: the logger doesn't exist yet)
@@ -173,10 +173,17 @@ fn spawn_archive_thread(
             };
 
             let path_rel = path.strip_prefix(&root_parent).unwrap();
-            let path_bytes = path_rel.as_os_str().as_bytes();
+            let path_bytes = match path_to_bytes(path_rel) {
+                Ok(b) => b,
+                Err(e) => {
+                    let _ = log_tx.send(LogMsg::Error(format!("Err -- unable to archive {}: {}", path.display(), e)));
+                    buf_tx.send(buf).unwrap();
+                    continue;
+                }
+            };
             let path_len = path_bytes.len() as u64;
             buf.extend_from_slice(&path_len.to_le_bytes());
-            buf.extend_from_slice(path_bytes);
+            buf.extend_from_slice(&path_bytes);
 
             buf.extend_from_slice(&file_len.to_le_bytes());
 
@@ -319,7 +326,10 @@ impl ExistingPaths {
                 break;
             }
 
-            let rel_path = PathBuf::from(std::ffi::OsString::from_vec(path_bytes));
+            let rel_path = match bytes_to_path(path_bytes) {
+                Ok(p) => p,
+                Err(_) => break,
+            };
             paths.push(root_parent.join(rel_path));
             last_header_pos = pos;
         }

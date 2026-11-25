@@ -2,12 +2,11 @@ use std::{
     fs::{self, File},
     path::{Path, PathBuf},
     io::{self, BufReader, Read},
-    ffi::OsString,
-    os::unix::ffi::OsStringExt,
     time::SystemTime,
 };
 use crate::cli::Args;
 use crate::utils::logger::{LogEntry, LogMsg, Logger};
+use crate::utils::path::bytes_to_path;
 
 pub fn extract(args: Args) -> io::Result<()> {
     // validate args
@@ -128,8 +127,7 @@ fn read_archive(
 }
 
 fn parse_path(reader: &mut BufReader<File>) -> io::Result<PathBuf> {
-    // archive stores raw OS path bytes, so decode them the same way (no UTF-8 pass)
-    Ok(PathBuf::from(OsString::from_vec(get_payload(reader)?)))
+    bytes_to_path(get_payload(reader)?)
 }
 
 fn parse_content(reader: &mut BufReader<File>) -> io::Result<Vec<u8>> {
