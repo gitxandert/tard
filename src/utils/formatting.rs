@@ -12,6 +12,18 @@ pub fn format_size(bytes: u64) -> String {
     }
 }
 
+/// "42s", "4m05s", "2h07m"
+pub fn format_duration(d: Duration) -> String {
+    let s = d.as_secs();
+    if s < 60 {
+        format!("{}s", s)
+    } else if s < 3600 {
+        format!("{}m{:02}s", s / 60, s % 60)
+    } else {
+        format!("{}h{:02}m", s / 3600, s / 60 % 60)
+    }
+}
+
 /// "512KB", "64MB", "1GB", "1TB", "100B" or a bare byte count.
 pub fn parse_size(s: &str) -> Result<usize, String> {
     let suffixes = [

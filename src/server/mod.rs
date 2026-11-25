@@ -1,5 +1,6 @@
 pub mod client;
 pub mod daemon;
+pub mod jobs;
 pub mod proto;
 
 use std::{

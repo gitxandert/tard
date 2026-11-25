@@ -187,7 +187,7 @@ pub fn format_iso_time(t: SystemTime) -> String {
 }
 
 /// e.g. 2026-11-23_19-18-05 (UTC, filename-safe)
-fn format_filename_time(t: SystemTime) -> String {
+pub fn format_filename_time(t: SystemTime) -> String {
     let (y, mo, d, h, mi, s) = civil(t);
     format!("{:04}-{:02}-{:02}_{:02}-{:02}-{:02}", y, mo, d, h, mi, s)
 }

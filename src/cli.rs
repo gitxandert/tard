@@ -1,5 +1,6 @@
 use std::{
     env,
+    ffi::OsString,
     path::{Path, PathBuf},
 };
 use crate::archive::archive::archive;
@@ -44,13 +45,16 @@ pub fn route_args() {
 }
 
 fn parse_args() -> Result<Args, String> {
-    let mut args = env::args();
-    // skip file
-    let _ = args.next();
+    parse_args_from(env::args_os().skip(1))
+}
 
+/// Parses tard's job arguments (no program name). Paths are made absolute against
+/// the current directory, so they must exist.
+pub fn parse_args_from<I: IntoIterator<Item = OsString>>(args: I) -> Result<Args, String> {
+    let mut args = args.into_iter();
     let mut args_struct = Args::new();
     while let Some(a) = args.next() {
-        match a.as_str() {
+        match a.to_str().unwrap_or("") {
             "-h" | "--help" => {
                 args_struct.cmd = Cmd::Help;
                 return Ok(args_struct);
@@ -60,48 +64,28 @@ fn parse_args() -> Result<Args, String> {
             "-c" | "--continue"  => args_struct.resume = true,
             "-v" | "--verbose" => args_struct.verbose = true,
             "-r" | "--ram" => {
-                if let Some(a) = args.next() {
-                    args_struct.max_ram = match parse_size(&a) {
-                        Ok(ram) => ram,
-                        Err(e) => return Err(e),
-                    }
-                } else {
-                    return Err("unspecified value for -r/--ram".to_string());
-                }
+                let v = args.next().ok_or("unspecified value for -r/--ram")?;
+                args_struct.max_ram = parse_size(&v.to_string_lossy())?;
+                args_struct.ram_given = true;
             }
             "-n" | "--num_workers" => {
-                if let Some(a) = args.next() {
-                    args_struct.num_workers = match a.parse::<usize>() {
-                        Ok(d) => d,
-                        Err(e) => return Err(e.to_string()),
-                    }
-                } else {
-                    return Err("unspecified value for -n/--num_workers".to_string());
-                }
+                let v = args.next().ok_or("unspecified value for -n/--num_workers")?;
+                args_struct.num_workers = match v.to_string_lossy().parse::<usize>() {
+                    Ok(0) => return Err("-n/--num_workers must be at least 1".to_string()),
+                    Ok(d) => d,
+                    Err(e) => return Err(format!("-n/--num_workers: {}", e)),
+                };
+                args_struct.workers_given = true;
             }
             _ => {
-                match args_struct.input_dir {
-                    None => {
-                        let input_path = PathBuf::from(Path::new(&a));
-                        let input_dir = match input_path.canonicalize() {
-                            Ok(id) => id,
-                            Err(e) => return Err(e.to_string()),
-                        };
-                        args_struct.input_dir = Some(input_dir);
-                    }
-                    Some(_) => {
-                        match args_struct.output_dir {
-                            None => {
-                                let output_path = PathBuf::from(Path::new(&a));
-                                let output_dir = match output_path.canonicalize() {
-                                    Ok(od) => od,
-                                    Err(e) => return Err(e.to_string()),
-                                };
-                                args_struct.output_dir = Some(output_dir);
-                            }
-                            Some(_) => return Err("can only specify one input dir and one output dir".to_string()),
-                        }
-                    }
+                let path = PathBuf::from(&a).canonicalize()
+                    .map_err(|e| format!("{}: {}", Path::new(&a).display(), e))?;
+                if args_struct.input_dir.is_none() {
+                    args_struct.input_dir = Some(path);
+                } else if args_struct.output_dir.is_none() {
+                    args_struct.output_dir = Some(path);
+                } else {
+                    return Err("can only specify one input dir and one output dir".to_string());
                 }
             }
         }
@@ -137,20 +121,25 @@ Options:
 // enums, structs
 //
 
-enum Cmd {
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Cmd {
     Archive,
     Extract,
     Help,
 }
 
+#[derive(Clone, Debug)]
 pub struct Args {
-    cmd: Cmd,
+    pub cmd: Cmd,
     pub input_dir: Option<PathBuf>,
     pub output_dir: Option<PathBuf>,
     pub max_ram: usize,
     pub num_workers: usize,
     pub resume: bool,
     pub verbose: bool,
+    /// -r / -n were given explicitly (the server sizes jobs without them)
+    pub ram_given: bool,
+    pub workers_given: bool,
 }
 
 impl Args {
@@ -164,7 +153,27 @@ impl Args {
             num_workers: 8usize,
             resume: false,
             verbose: false,
+            ram_given: false,
+            workers_given: false,
         }
+    }
+
+    /// The arguments that make `tard` run this job (the inverse of parse_args_from).
+    pub fn to_argv(&self) -> Vec<OsString> {
+        let mut v: Vec<OsString> = vec![if self.cmd == Cmd::Extract { "-x" } else { "-a" }.into()];
+        v.extend(self.input_dir.iter().map(|p| p.clone().into_os_string()));
+        v.extend(self.output_dir.iter().map(|p| p.clone().into_os_string()));
+        if self.resume { v.push("-c".into()); }
+        if self.verbose { v.push("-v".into()); }
+        if self.ram_given {
+            v.push("-r".into());
+            v.push(self.max_ram.to_string().into());
+        }
+        if self.workers_given {
+            v.push("-n".into());
+            v.push(self.num_workers.to_string().into());
+        }
+        v
     }
 
     pub fn input_dir(&self) -> Option<&Path> {

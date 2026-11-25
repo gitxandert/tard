@@ -10,7 +10,7 @@ use std::{
 };
 use crate::config::Config;
 use crate::server::proto::{self, Frame};
-use crate::server::{create_private_dir, daemon, server_dir, server_log_path, token_path};
+use crate::server::{create_private_dir, daemon, jobs, server_dir, server_log_path, token_path};
 use crate::utils::path::path_to_bytes;
 
 const START_TIMEOUT: Duration = Duration::from_secs(5);
@@ -37,46 +37,103 @@ pub fn main(args: Vec<OsString>) -> i32 {
             print_help();
             0
         }
-        Some("stop") => match send(&config, &args) {
-            Err(Unreachable) => {
-                eprintln!("server is not running");
-                1
-            }
+        Some("stop") => send_or(&config, &args, "server is not running"),
+        Some("log") => match send(&config, &args) {
             Ok(code) => code,
+            Err(Unreachable) => log_offline(&args[1..]),
         },
-        Some(_) => match send(&config, &args) {
-            Err(Unreachable) => {
-                eprintln!("server is not running (start it with: tard server start)");
-                1
-            }
-            Ok(code) => code,
-        },
+        Some("ping") | Some("ls") | Some("drop") => {
+            send_or(&config, &args, "server is not running (start it with: tard server start)")
+        }
+        // anything else is a job: tard server <input> <output> [options]
+        Some(_) => submit(&config, args),
     }
 }
 
 /// The server didn't answer on its port.
 struct Unreachable;
 
+fn send_or(config: &Config, args: &[OsString], unreachable: &str) -> i32 {
+    send(config, args).unwrap_or_else(|Unreachable| {
+        eprintln!("{}", unreachable);
+        1
+    })
+}
+
+fn is_up(config: &Config) -> bool {
+    matches!(request(config, &[OsString::from("ping")], &mut io::sink(), &mut io::sink()), Ok(0))
+}
+
 fn start(config: &Config) -> i32 {
-    let ping = [OsString::from("ping")];
-    if let Ok(code) = send(config, &ping) {
-        return code; // already running: ping printed its status
+    if !is_up(config) {
+        if let Err(code) = launch(config) {
+            return code;
+        }
     }
+    send_or(config, &[OsString::from("ping")], "server stopped right after starting")
+}
+
+/// Checks the job here, where relative paths mean something, then hands it to the
+/// server, starting the server first if needed.
+fn submit(config: &Config, args: Vec<OsString>) -> i32 {
+    let job = match jobs::parse_job(args) {
+        Ok(j) => j,
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            return 2;
+        }
+    };
+    if !is_up(config) {
+        if let Err(code) = launch(config) {
+            return code;
+        }
+    }
+    let mut req = vec![OsString::from("submit")];
+    req.extend(job.to_argv());
+    send_or(config, &req, "server stopped before the job was sent")
+}
+
+/// Starts the server and waits until it answers.
+fn launch(config: &Config) -> Result<(), i32> {
     if let Err(e) = spawn_daemon() {
         eprintln!("Error: could not start server: {}", e);
-        return 1;
+        return Err(1);
     }
     let deadline = Instant::now() + START_TIMEOUT;
     while Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(50));
         // a stale token can be read before the new server writes its own; retry until it answers
-        if let Ok(0) = request(config, &ping, &mut io::sink(), &mut io::sink()) {
-            return send(config, &ping).unwrap_or(1);
+        if is_up(config) {
+            return Ok(());
         }
     }
     eprintln!("Error: server did not come up within {}s. Last lines of {}:", START_TIMEOUT.as_secs(), server_log_path().display());
     print_tail(&server_log_path(), 5);
-    1
+    Err(1)
+}
+
+/// `log` with the server down: print the latest matching log as it stands.
+fn log_offline(args: &[OsString]) -> i32 {
+    let [key] = args else {
+        eprintln!("usage: tard server log <job id | input name>");
+        return 2;
+    };
+    let key = key.to_string_lossy();
+    let logs = jobs::find_logs(&jobs::logs_dir(), &key);
+    let Some(path) = logs.last() else {
+        eprintln!("no log found for '{}'", key);
+        return 1;
+    };
+    match fs::read(path) {
+        Ok(b) => {
+            let _ = io::stdout().write_all(&b);
+            0
+        }
+        Err(e) => {
+            eprintln!("Error: could not read {}: {}", path.display(), e);
+            1
+        }
+    }
 }
 
 /// Starts `tard server run` detached, its output appended to server.log.
@@ -157,18 +214,34 @@ fn print_tail(path: &Path, n: usize) {
 fn print_help() {
     println!(
 "Usage: tard server [COMMAND]
+       tard server <INPUT> <OUTPUT_DIR> [OPTIONS]
 
 Run tard jobs from a background server. Settings live in {}.
 
-Commands:
+Jobs:
+  <INPUT> <OUTPUT_DIR> [OPTIONS]
+             Queue a job, starting the server if needed. Takes the same options
+             as tard itself (-a, -x, -c, -v, -r, -n); see tard -h
+  ls         List running and queued jobs
+  log <ID|NAME>
+             Print a job's log, by job id or input file name (latest match),
+             following it while the job runs
+  drop <ID>...
+             Stop a running job or remove a queued one. A dropped archive can
+             be resumed with -c
+
+Server:
   start      Start the server in the background (also: bare `tard server`)
-  stop       Stop the server
+  stop [--wait]
+             Stop the server. Running jobs are dropped and saved, with the
+             queue, to resume on the next start; --wait lets them finish first
   run        Run the server in the foreground (for systemd and debugging)
   ping       Show whether the server is running
   -h, --help Show this help
 
-Server output is appended to {}.",
+Job logs are in {}; server output is appended to {}.",
         crate::config::config_path().display(),
+        jobs::logs_dir().display(),
         server_log_path().display(),
     );
 }
