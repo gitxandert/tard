@@ -99,6 +99,74 @@ pub fn parse_args_from<I: IntoIterator<Item = OsString>>(args: I) -> Result<Args
     Ok(args_struct)
 }
 
+/// Deletes the oldest per-file logs in `dir` beyond `keep`. Only files named like
+/// `<name>_<YYYY-MM-DD_HH-MM-SS>[_N].log` count, so nothing else there is touched.
+/// Best effort: a log still open by a running job may refuse (Windows) and stay.
+pub fn prune_file_logs(dir: &Path, keep: usize) {
+    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    let mut logs: Vec<(std::time::SystemTime, PathBuf)> = rd
+        .flatten()
+        .filter(|e| e.file_name().to_str().is_some_and(is_file_log_name))
+        .filter_map(|e| Some((e.metadata().ok()?.modified().ok()?, e.path())))
+        .collect();
+    if logs.len() <= keep {
+        return;
+    }
+    logs.sort();
+    let excess = logs.len() - keep;
+    for (_, p) in logs.into_iter().take(excess) {
+        let _ = std::fs::remove_file(p);
+    }
+}
+
+fn is_file_log_name(name: &str) -> bool {
+    let Some(stem) = name.strip_suffix(".log") else { return false };
+    // drop a trailing _N added for same-second runs
+    let stem = match stem.rsplit_once('_') {
+        Some((head, n)) if !n.is_empty() && n.len() <= 4 && n.bytes().all(|b| b.is_ascii_digit()) && head.len() >= 20 => head,
+        _ => stem,
+    };
+    let Some(stamp) = stem.len().checked_sub(19).and_then(|i| stem.get(i..)) else { return false };
+    let ok = stamp.bytes().enumerate().all(|(i, b)| match i {
+        4 | 7 | 13 | 16 => b == b'-',
+        10 => b == b'_',
+        _ => b.is_ascii_digit(),
+    });
+    ok && stem.len() > 20 && stem.as_bytes()[stem.len() - 20] == b'_'
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn file_log_names() {
+        assert!(is_file_log_name("photos_2026-11-25_02-36-47.log"));
+        assert!(is_file_log_name("my_photos_2026-11-25_02-36-47_2.log"));
+        assert!(!is_file_log_name("notes.log"));
+        assert!(!is_file_log_name("photos_2026-11-25.log"));
+        assert!(!is_file_log_name("2026-11-25_02-36-47.log")); // no name
+    }
+
+    #[test]
+    fn prune_keeps_newest_and_ignores_others() {
+        let dir = std::env::temp_dir().join(format!("tard_test_{}_filelogs", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for i in 0..5 {
+            std::fs::write(dir.join(format!("a_2026-11-25_02-36-4{}.log", i)), "").unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(15)); // distinct mtimes
+        }
+        std::fs::write(dir.join("keep-me.log"), "").unwrap();
+        prune_file_logs(&dir, 2);
+        let mut left: Vec<String> = std::fs::read_dir(&dir).unwrap().flatten()
+            .map(|e| e.file_name().into_string().unwrap()).collect();
+        left.sort();
+        assert_eq!(left, ["a_2026-11-25_02-36-43.log", "a_2026-11-25_02-36-44.log", "keep-me.log"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
 /// A size as -r takes it, in the largest unit that keeps it exact: "64MB", "1536KB".
 fn size_arg(n: usize) -> String {
     for (suffix, shift) in [("TB", 40), ("GB", 30), ("MB", 20), ("KB", 10)] {
@@ -188,7 +256,12 @@ impl Args {
         let dir = match &self.file_log {
             Some(p) if p.is_dir() || p.as_os_str().to_string_lossy().ends_with(std::path::is_separator) => p.clone(),
             Some(p) => return p.clone(),
-            None => crate::config::files_log_dir(),
+            None => {
+                let (dir, keep) = crate::config::files_log_settings();
+                // make room for the one about to be written
+                prune_file_logs(&dir, keep.saturating_sub(1));
+                dir
+            }
         };
         // two runs of the same name in the same second (e.g. parallel server jobs)
         // mustn't share a log

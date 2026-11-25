@@ -33,7 +33,8 @@ max_workers = 8
 express_when_full = "wait"
 
 [logs]
-# job logs kept in ~/.tard/server/logs (oldest are deleted first)
+# logs kept, each, in ~/.tard/server/logs and the per-file log directory below
+# (oldest are deleted first; directories given with tard -l are left alone)
 keep = 100
 # where each run's per-file CSV log goes when tard isn't given -l; "~" is your home.
 # Default: logs/ in the tard directory (~/.tard/logs)
@@ -201,7 +202,15 @@ impl Logs {
 /// Per-file CSV log directory from the config, falling back to the default if the
 /// config can't be read (a plain `tard -a` shouldn't fail over a typo in it).
 pub fn files_log_dir() -> PathBuf {
-    Config::load().map(|c| c.logs.files_dir()).unwrap_or_else(|_| tard_dir().join("logs"))
+    files_log_settings().0
+}
+
+/// The per-file CSV log directory and how many logs to keep in it.
+pub fn files_log_settings() -> (PathBuf, usize) {
+    match Config::load() {
+        Ok(c) => (c.logs.files_dir(), c.logs.keep),
+        Err(_) => (tard_dir().join("logs"), Logs::default().keep),
+    }
 }
 
 /// "~" or "~/..." to the home directory.
