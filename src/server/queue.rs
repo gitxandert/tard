@@ -305,7 +305,7 @@ mod tests {
     fn job(id: JobId, extra: &[&str]) -> Job {
         let mut argv: Vec<std::ffi::OsString> = vec!["/".into(), "/".into()];
         argv.extend(extra.iter().map(|s| s.into()));
-        Job { id, args: parse_args_from(argv).unwrap(), submitted: SystemTime::now() }
+        Job { id, args: parse_args_from(argv).unwrap(), submitted: SystemTime::now(), schedule: None }
     }
 
     fn lim() -> Limits {

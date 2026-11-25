@@ -10,7 +10,7 @@ use std::{
 };
 use crate::config::Config;
 use crate::server::proto::{self, Frame};
-use crate::server::{create_private_dir, daemon, jobs, server_dir, server_log_path, token_path};
+use crate::server::{create_private_dir, daemon, jobs, prompt, server_dir, server_log_path, token_path};
 use crate::utils::path::path_to_bytes;
 
 const START_TIMEOUT: Duration = Duration::from_secs(5);
@@ -56,6 +56,7 @@ pub fn main(args: Vec<OsString>) -> i32 {
             }
             send_or(&config, &req, "server is not running (start it with: tard server start)")
         }
+        Some("schedule") => schedule(&config, &args[1..]),
         // anything else is a job: tard server <input> <output> [options]
         Some(_) => submit(&config, args),
     }
@@ -110,6 +111,122 @@ fn submit(config: &Config, args: Vec<OsString>) -> i32 {
     send_or(config, &req, "server stopped before the job was sent")
 }
 
+/// `tard server schedule ...`. The flags mirror the top-level commands and also take
+/// job ids, so `schedule -r 12` is `drop 12` and `schedule -l 12` is `log 12`.
+fn schedule(config: &Config, args: &[OsString]) -> i32 {
+    let flag = args.first().and_then(|a| a.to_str());
+    if matches!(flag, Some("-h" | "--help")) {
+        print_schedule_help();
+        return 0;
+    }
+    if !is_up(config) {
+        if let Err(code) = launch(config) {
+            return code;
+        }
+    }
+    let target = args.get(1).map(|a| a.to_string_lossy().into_owned());
+    let is_id = |t: &str| t.chars().all(|c| c.is_ascii_digit());
+    let os = |v: &[&str]| v.iter().map(OsString::from).collect::<Vec<_>>();
+    let down = "server stopped unexpectedly";
+    match (flag, target.as_deref()) {
+        (None, _) => send_or(config, &os(&["schedule"]), down),
+        (Some("-n" | "--new"), Some(name)) => {
+            if let Err(e) = crate::server::schedule::check_name(name) {
+                eprintln!("Error: {}", e);
+                return 2;
+            }
+            if matches!(request(config, &os(&["schedule-get", name]), &mut io::sink(), &mut io::sink()), Ok(0)) {
+                eprintln!("a scheduled job named '{}' already exists (edit it with: tard server schedule -e {})", name, name);
+                return 1;
+            }
+            run_prompts(config, name, None)
+        }
+        (Some("-e" | "--edit"), Some(t)) if is_id(t) => {
+            let mut req = vec![OsString::from("edit"), t.into()];
+            match jobs::absolutize(args[2..].to_vec()) {
+                Ok(rest) => req.extend(rest),
+                Err(e) => { eprintln!("Error: {}", e); return 2; }
+            }
+            send_or(config, &req, down)
+        }
+        (Some("-e" | "--edit"), Some(name)) => {
+            let mut out = Vec::new();
+            match request(config, &os(&["schedule-get", name]), &mut out, &mut io::stderr()) {
+                Ok(0) => (),
+                Ok(code) => return code,
+                Err(Unreachable) => { eprintln!("{}", down); return 1; }
+            }
+            let Some(cur) = prompt::Current::parse(&String::from_utf8_lossy(&out)) else {
+                eprintln!("Error: unexpected reply from server");
+                return 1;
+            };
+            run_prompts(config, name, Some(&cur))
+        }
+        (Some("-r" | "--remove"), Some(_)) => {
+            let mut code = 0;
+            for t in &args[1..] {
+                let t = t.to_string_lossy();
+                let req = if is_id(&t) { os(&["drop", &t]) } else { os(&["schedule-rm", &t]) };
+                code = code.max(send_or(config, &req, down));
+            }
+            code
+        }
+        (Some("-l" | "--log"), Some(t)) => {
+            let verb = if is_id(t) { "log" } else { "schedule-log" };
+            send_or(config, &os(&[verb, t]), down)
+        }
+        (Some("-n" | "--new" | "-e" | "--edit" | "-r" | "--remove" | "-l" | "--log"), None) => {
+            eprintln!("{} needs a scheduled job name (or a job id); see tard server schedule -h", flag.unwrap());
+            2
+        }
+        (Some(f), _) if f.starts_with('-') => {
+            eprintln!("unknown option {} (see tard server schedule -h)", f);
+            2
+        }
+        (Some(name), _) => send_or(config, &os(&["schedule", name]), down),
+    }
+}
+
+fn run_prompts(config: &Config, name: &str, current: Option<&prompt::Current>) -> i32 {
+    match prompt::schedule_request(name, current) {
+        Ok(Some(req)) => send_or(config, &req, "server stopped before the schedule was saved"),
+        Ok(None) => {
+            println!("not saved");
+            1
+        }
+        Err(e) => {
+            eprintln!("{}", e);
+            1
+        }
+    }
+}
+
+fn print_schedule_help() {
+    println!(
+"Usage: tard server schedule [OPTION] [NAME | JOB ID]
+
+Run jobs at set times. Scheduled runs start at their time, alongside the queue
+(waiting for room if needed), and log to {}/<NAME>/.
+
+  schedule                 List scheduled jobs
+  schedule NAME            Show a scheduled job: its arguments, how often it runs,
+                           its next run, and its last runs with their status
+  -n, --new NAME           Create a scheduled job, step by step: the job's
+                           arguments, then how many runs (once, N, or series),
+                           then when it first runs
+  -e, --edit NAME|ID       Change a scheduled job (same steps, current values as
+                           defaults), or a queued job by id, like `edit`
+  -r, --remove NAME|ID...  Remove scheduled jobs, or drop jobs by id, like `drop`
+  -l, --log NAME|ID        Print the latest run's log (following it while it
+                           runs), or a job's log by id, like `log`
+
+Repeats: every 30m / 6h / 1d / 2w, or days and a time: mon,thu 03:00,
+daily 03:00, weekdays 09:30, weekends 10:00. Times are local. Runs missed while
+the server was down are run once when it starts.",
+        jobs::logs_dir().join("scheduled").display(),
+    );
+}
+
 /// Starts the server and waits until it answers.
 fn launch(config: &Config) -> Result<(), i32> {
     if let Err(e) = spawn_daemon() {
@@ -136,7 +253,7 @@ fn log_offline(args: &[OsString]) -> i32 {
         return 2;
     };
     let key = key.to_string_lossy();
-    let logs = jobs::find_logs(&jobs::logs_dir(), &key);
+    let logs = jobs::find_logs(&key);
     let Some(path) = logs.last() else {
         eprintln!("no log found for '{}'", key);
         return 1;
@@ -261,6 +378,8 @@ Jobs:
              Change a queued or paused job: options given replace the job's,
              -r auto / -n auto let the server decide, paths replace its input
              (then output)
+  schedule [...]
+             Run jobs at set times; see tard server schedule -h
 
 Server:
   start      Start the server in the background (also: bare `tard server`)

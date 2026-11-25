@@ -12,15 +12,17 @@ pub fn format_size(bytes: u64) -> String {
     }
 }
 
-/// "42s", "4m05s", "2h07m"
+/// "42s", "4m05s", "2h07m", "3d04h"
 pub fn format_duration(d: Duration) -> String {
     let s = d.as_secs();
     if s < 60 {
         format!("{}s", s)
     } else if s < 3600 {
         format!("{}m{:02}s", s / 60, s % 60)
-    } else {
+    } else if s < 2 * 86_400 {
         format!("{}h{:02}m", s / 3600, s / 60 % 60)
+    } else {
+        format!("{}d{:02}h", s / 86_400, s / 3600 % 24)
     }
 }
 

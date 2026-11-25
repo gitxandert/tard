@@ -1,8 +1,10 @@
 pub mod client;
 pub mod daemon;
 pub mod jobs;
+pub mod prompt;
 pub mod proto;
 pub mod queue;
+pub mod schedule;
 
 use std::{
     fs::{self, File, OpenOptions},

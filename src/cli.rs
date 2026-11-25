@@ -94,6 +94,16 @@ pub fn parse_args_from<I: IntoIterator<Item = OsString>>(args: I) -> Result<Args
     Ok(args_struct)
 }
 
+/// A size as -r takes it, in the largest unit that keeps it exact: "64MB", "1536KB".
+fn size_arg(n: usize) -> String {
+    for (suffix, shift) in [("TB", 40), ("GB", 30), ("MB", 20), ("KB", 10)] {
+        if n != 0 && n % (1usize << shift) == 0 {
+            return format!("{}{}", n >> shift, suffix);
+        }
+    }
+    n.to_string()
+}
+
 fn print_help() {
     let d = Args::new();
     println!(
@@ -167,7 +177,7 @@ impl Args {
         if self.verbose { v.push("-v".into()); }
         if self.ram_given {
             v.push("-r".into());
-            v.push(self.max_ram.to_string().into());
+            v.push(size_arg(self.max_ram).into());
         }
         if self.workers_given {
             v.push("-n".into());

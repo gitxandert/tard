@@ -14,7 +14,8 @@ use crate::cli::Cmd;
 use crate::config::{Config, WhenFull};
 use crate::server::jobs::{self, Job, JobId};
 use crate::server::proto::{self, Frame};
-use crate::server::queue::{Chain, Limits, Queue, Res, Running, Spot, StopRequest};
+use crate::server::queue::{Chain, Lane, Limits, Queue, Res, Running, Spot, StopRequest};
+use crate::server::schedule::{self, Run, Schedule, Zdt};
 use crate::server::{create_private_dir, create_private_file, pid_path, server_dir, token_path};
 use crate::utils::formatting::{format_duration, format_size};
 use crate::utils::logger::format_iso_time;
@@ -32,11 +33,14 @@ struct Daemon {
     state: Mutex<State>,
     /// signalled whenever a running job finishes
     finished: Condvar,
+    /// signalled when schedules change, so the scheduler rechecks its next wake-up
+    sched_wake: Condvar,
 }
 
 struct State {
     next_id: JobId,
     q: Queue,
+    schedules: Vec<Schedule>,
     stopping: bool,
 }
 
@@ -76,8 +80,9 @@ pub fn run() -> Result<(), String> {
     if !saved.is_empty() {
         event(&format!("restored {} waiting job(s)", saved.len()));
     }
+    let schedules = schedule::load()?;
     let next_id = read_next_id()
-        .max(jobs::max_logged_id(&jobs::logs_dir()) + 1)
+        .max(jobs::max_logged_id() + 1)
         .max(saved.iter().map(|(j, ..)| j.id + 1).max().unwrap_or(1));
 
     let daemon = Arc::new(Daemon {
@@ -86,11 +91,14 @@ pub fn run() -> Result<(), String> {
         limits,
         started: SystemTime::now(),
         exe,
-        state: Mutex::new(State { next_id, q: Queue::restore(saved), stopping: false }),
+        state: Mutex::new(State { next_id, q: Queue::restore(saved), schedules, stopping: false }),
         finished: Condvar::new(),
+        sched_wake: Condvar::new(),
     });
     save(&daemon.lock().q); // drops any jobs that failed to load
     kick(&daemon);
+    let d = Arc::clone(&daemon);
+    thread::spawn(move || scheduler(d)); // runs anything missed while the server was down
 
     for stream in listener.incoming() {
         match stream {
@@ -145,7 +153,9 @@ fn kick(d: &Arc<Daemon>) -> Vec<JobId> {
         let planned = st.q.plan(&d.limits);
         let now = SystemTime::now();
         let starts = planned.into_iter().map(|s| {
-            let log = jobs::new_log_path(&jobs::logs_dir(), s.job.id, &s.job.args, now);
+            let dir = jobs::log_dir_for(&s.job);
+            let _ = create_private_dir(&dir);
+            let log = jobs::new_log_path(&dir, s.job.id, &s.job.args, now);
             // into running under the same lock, so `ls` and `drop` always see the job
             st.q.running.push(Running { job: s.job.clone(), chain: s.chain, alloc: s.alloc, log: log.clone(), started: now, stop: None });
             (s.job, s.alloc, log)
@@ -170,7 +180,7 @@ fn kick(d: &Arc<Daemon>) -> Vec<JobId> {
                 event(&format!("job {} could not start: {}", job.id, e));
                 let d = Arc::clone(d);
                 // finish() kicks again, so don't do it while this kick is still unwinding
-                thread::spawn(move || finish(&d, job.id, Ended::Failed));
+                thread::spawn(move || finish(&d, job.id, Ended::Failed, "could not start".into(), Duration::ZERO));
             }
         }
     }
@@ -239,7 +249,8 @@ fn supervise(d: Arc<Daemon>, id: JobId, mut child: Child, log: PathBuf, started:
         thread::sleep(POLL);
     };
 
-    let took = format_duration(started.elapsed().unwrap_or_default());
+    let ran = started.elapsed().unwrap_or_default();
+    let took = format_duration(ran);
     let (summary, ended) = match outcome {
         Outcome::Exited(s) if s.success() => (format!("finished in {}", took), Ended::Ok),
         Outcome::Exited(s) => (match s.code() {
@@ -254,11 +265,14 @@ fn supervise(d: Arc<Daemon>, id: JobId, mut child: Child, log: PathBuf, started:
     };
     append(&log, &format!("--- {} ({})\n", summary, format_iso_time(SystemTime::now())));
     event(&format!("job {} {}", id, summary));
-    finish(&d, id, ended);
+    // the summary up to " after"/" in" is the short status kept in schedule history
+    let status = summary.split(" after ").next().unwrap_or(&summary).split(" in ").next().unwrap_or(&summary);
+    let status = if status == "finished" { "ok" } else { status };
+    finish(&d, id, ended, status.to_string(), ran);
 }
 
 /// Takes a job out of `running` once its log is complete, then starts what can run.
-fn finish(d: &Arc<Daemon>, id: JobId, ended: Ended) {
+fn finish(d: &Arc<Daemon>, id: JobId, ended: Ended, status: String, ran: Duration) {
     let mut st = d.lock();
     if let Ended::Stopped(StopRequest::Requeue) = ended {
         if let Some(r) = st.q.running.iter().find(|r| r.job.id == id) {
@@ -276,8 +290,19 @@ fn finish(d: &Arc<Daemon>, id: JobId, ended: Ended) {
         event(&format!("job {} skipped: job {} earlier in its chain failed", j.id, id));
     }
     save(&st.q);
+    if let Some(name) = r.as_ref().and_then(|r| r.job.schedule.clone()) {
+        let entry = st.schedules.iter_mut().find(|s| s.name == name)
+            .and_then(|s| s.history.iter_mut().rev().find(|h| h.job == id));
+        if let Some(h) = entry {
+            h.status = status;
+            h.secs = ran.as_secs();
+            save_schedules(&st.schedules);
+        }
+    }
     let live: Vec<&Path> = st.q.running.iter().map(|r| r.log.as_path()).collect();
-    jobs::prune_logs(&jobs::logs_dir(), d.config.logs.keep, &live);
+    if let Some(dir) = r.as_ref().and_then(|r| r.log.parent()) {
+        jobs::prune_logs(dir, d.config.logs.keep, &live);
+    }
     drop(st);
     d.finished.notify_all();
     kick(d);
@@ -327,6 +352,23 @@ fn handle(d: &Arc<Daemon>, stream: TcpStream) -> io::Result<()> {
         "drop" | "pause" | "resume" if rest.is_empty() => { reply.err(&ids_usage(cmd))?; 2 }
         "drop" | "pause" | "resume" => for_each_id(d, &mut reply, cmd, rest)?,
         "edit" => edit(d, &mut reply, rest)?,
+        "schedule" => match rest {
+            [] => schedule_list(d, &mut reply)?,
+            [name] => schedule_show(d, &mut reply, &name.to_string_lossy())?,
+            _ => { reply.err("usage: tard server schedule [<name>]")?; 2 }
+        },
+        "schedule-add" | "schedule-set" => schedule_put(d, &mut reply, cmd == "schedule-set", rest)?,
+        "schedule-get" | "schedule-rm" | "schedule-log" => match rest {
+            [name] => {
+                let name = name.to_string_lossy();
+                match cmd {
+                    "schedule-get" => schedule_get(d, &mut reply, &name)?,
+                    "schedule-rm" => schedule_rm(d, &mut reply, &name)?,
+                    _ => schedule_log(d, &mut reply, &name)?,
+                }
+            }
+            _ => { reply.err(&format!("usage: {} <name>", cmd))?; 2 }
+        },
         "stop" => {
             let wait = rest.iter().any(|a| a == "--wait" || a == "-w");
             stop(d, &mut reply, wait)?;
@@ -369,7 +411,7 @@ fn submit(d: &Arc<Daemon>, reply: &mut Reply, tokens: Vec<OsString>) -> io::Resu
             let id = st.next_id;
             st.next_id += 1;
             gi.push(id);
-            Job { id, args, submitted: now }
+            Job { id, args, submitted: now, schedule: None }
         }).collect::<Vec<_>>();
         ids.push(gi);
         g
@@ -466,7 +508,7 @@ fn log(d: &Daemon, reply: &mut Reply, key: &str) -> io::Result<i32> {
             return Ok(0);
         }
     }
-    let logs = jobs::find_logs(&jobs::logs_dir(), key);
+    let logs = jobs::find_logs(key);
     let Some(path) = logs.last() else {
         reply.err(&format!("no log found for '{}'", key))?;
         return Ok(1);
@@ -474,6 +516,11 @@ fn log(d: &Daemon, reply: &mut Reply, key: &str) -> io::Result<i32> {
     if logs.len() > 1 {
         reply.err(&format!("({} logs match '{}'; showing the latest)", logs.len(), key))?;
     }
+    follow(d, reply, path)
+}
+
+/// Sends a log file, then keeps sending what's appended while its job runs.
+fn follow(d: &Daemon, reply: &mut Reply, path: &Path) -> io::Result<i32> {
     let mut f = File::open(path)?;
     let mut buf = vec![0u8; 64 << 10];
     loop {
@@ -599,6 +646,246 @@ fn stop(d: &Daemon, reply: &mut Reply, wait: bool) -> io::Result<()> {
     } else {
         reply.out("server stopped")
     }
+}
+
+// schedules
+
+fn save_schedules(s: &[Schedule]) {
+    if let Err(e) = schedule::save(s) {
+        event(&format!("could not save schedules: {}", e));
+    }
+}
+
+/// Submits scheduled runs when they come due (and, on startup, any that were missed
+/// while the server was down, once each).
+fn scheduler(d: Arc<Daemon>) {
+    loop {
+        let now = Zdt::now();
+        let mut submitted = false;
+        let mut st = d.lock();
+        if !st.stopping {
+            let keep = d.config.schedule.history;
+            let State { schedules, q, next_id, .. } = &mut *st;
+            let mut changed = false;
+            for s in schedules.iter_mut() {
+                let Some(due) = s.next_time().filter(|t| *t <= now) else { continue };
+                changed = true;
+                let at = schedule::show(&now);
+                let mine = |j: &Job| j.schedule.as_deref() == Some(s.name.as_str());
+                let pending = q.running.iter().any(|r| mine(&r.job)) || q.waiting().iter().any(|(j, _)| mine(j));
+                if pending {
+                    s.record(Run { at, job: 0, status: "skipped: previous run still going".into(), secs: 0 }, keep);
+                    event(&format!("schedule {}: skipped a run, the previous one is still going", s.name));
+                } else {
+                    match jobs::parse_job(s.args.iter().map(OsString::from).collect()) {
+                        Ok(args) => {
+                            let id = *next_id;
+                            *next_id += 1;
+                            write_next_id(*next_id);
+                            event(&format!("schedule {}: job {} submitted: {}", s.name, id, jobs::describe(&args)));
+                            let job = Job { id, args, submitted: SystemTime::now(), schedule: Some(s.name.clone()) };
+                            // scheduled runs start at their time, alongside the queue
+                            q.submit(Chain { id, lane: Lane::Express, groups: [vec![job]].into() });
+                            s.record(Run { at, job: id, status: "queued".into(), secs: 0 }, keep);
+                            submitted = true;
+                        }
+                        Err(e) => {
+                            event(&format!("schedule {}: run not started: {}", s.name, e));
+                            s.record(Run { at, job: 0, status: format!("not run: {}", e), secs: 0 }, keep);
+                        }
+                    }
+                }
+                s.advance(&due, &now);
+                if s.next.is_none() {
+                    event(&format!("schedule {}: no runs left", s.name));
+                }
+            }
+            if changed {
+                save_schedules(schedules);
+                save(q);
+            }
+        }
+        // sleep until the next run is due, rechecking at least every minute (clock
+        // changes, suspend) and whenever a schedule is added or edited
+        let wait = st.schedules.iter().filter_map(|s| s.next_time())
+            .map(|t| t.timestamp().as_second() - now.timestamp().as_second())
+            .min()
+            .map_or(60, |s| s.clamp(0, 60)) as u64;
+        if submitted {
+            drop(st);
+            kick(&d);
+            continue;
+        }
+        let _ = d.sched_wake.wait_timeout(st, Duration::from_secs(wait.max(1)));
+    }
+}
+
+fn schedule_list(d: &Daemon, reply: &mut Reply) -> io::Result<i32> {
+    let st = d.lock();
+    if st.schedules.is_empty() {
+        reply.out("no scheduled jobs (add one with: tard server schedule -n <name>)")?;
+        return Ok(0);
+    }
+    let row = |a: &str, b: &str, c: &str, e: &str| format!("{:<20} {:<17} {:<32} {}", a, b, c, e);
+    reply.out(&row("NAME", "NEXT RUN", "REPEATS", "LAST RUN"))?;
+    for s in &st.schedules {
+        let next = s.next_time().map(|t| schedule::show(&t)).unwrap_or_else(|| "(done)".into());
+        let last = s.history.last().map(|h| run_status(&st.q, h)).unwrap_or_else(|| "-".into());
+        reply.out(&row(&s.name, &next, &s.regularity(), &last))?;
+    }
+    Ok(0)
+}
+
+/// "ok in 4m12s (job 31)", "running (job 32)", "skipped: ..."
+fn run_status(q: &Queue, h: &Run) -> String {
+    if h.job == 0 {
+        return h.status.clone();
+    }
+    let status = if h.status == "queued" && q.running.iter().any(|r| r.job.id == h.job) { "running" } else { h.status.as_str() };
+    let took = if h.secs > 0 || status == "ok" { format!(" in {}", format_duration(Duration::from_secs(h.secs))) } else { String::new() };
+    format!("{}{} (job {})", status, took, h.job)
+}
+
+fn find_schedule<'a>(st: &'a State, reply: &mut Reply, name: &str) -> io::Result<Option<&'a Schedule>> {
+    let s = st.schedules.iter().find(|s| s.name == name);
+    if s.is_none() {
+        reply.err(&format!("no scheduled job '{}' (see tard server schedule)", name))?;
+    }
+    Ok(s)
+}
+
+fn schedule_show(d: &Daemon, reply: &mut Reply, name: &str) -> io::Result<i32> {
+    let st = d.lock();
+    let Some(s) = find_schedule(&st, reply, name)? else { return Ok(1) };
+    reply.out(&s.name)?;
+    reply.out(&format!("  job:      {}", schedule::shell_join(&s.args)))?;
+    reply.out(&format!("  repeats:  {}", s.regularity()))?;
+    let next = match s.next_time() {
+        Some(t) => {
+            let secs = (t.timestamp().as_second() - Zdt::now().timestamp().as_second()).max(0) as u64;
+            format!("{} (in {})", schedule::show(&t), format_duration(Duration::from_secs(secs)))
+        }
+        None => "none, all runs done".into(),
+    };
+    reply.out(&format!("  next run: {}", next))?;
+    reply.out(&format!("  logs:     {}", jobs::scheduled_log_dir(&s.name).display()))?;
+    if s.history.is_empty() {
+        reply.out("  no runs yet")?;
+    } else {
+        reply.out(&format!("  last {} run(s):", s.history.len()))?;
+        for h in s.history.iter().rev() {
+            reply.out(&format!("    {}  {}", h.at, run_status(&st.q, h)))?;
+        }
+    }
+    Ok(0)
+}
+
+/// Fields for the client's edit prompts, one per line: repeat, runs ("forever" or a
+/// count), next run ("YYYY-MM-DD HH:MM" or empty), and the job's arguments.
+fn schedule_get(d: &Daemon, reply: &mut Reply, name: &str) -> io::Result<i32> {
+    let st = d.lock();
+    let Some(s) = find_schedule(&st, reply, name)? else { return Ok(1) };
+    reply.out(&s.repeat)?;
+    reply.out(&s.runs.map_or("forever".to_string(), |n| n.to_string()))?;
+    reply.out(&s.next_time().map(|t| schedule::show(&t)).unwrap_or_default())?;
+    reply.out(&schedule::shell_join(&s.args))?;
+    Ok(0)
+}
+
+/// schedule-add / schedule-set <name> <repeat> <runs|forever> <first run> <job args...>
+fn schedule_put(d: &Daemon, reply: &mut Reply, replace: bool, rest: &[OsString]) -> io::Result<i32> {
+    let parsed = (|| -> Result<Schedule, String> {
+        let [name, repeat, runs, first, argv @ ..] = rest else {
+            return Err("usage: schedule-add <name> <repeat> <runs|forever> <first run> <job args>".into());
+        };
+        let name = name.to_string_lossy().into_owned();
+        schedule::check_name(&name)?;
+        let repeat = schedule::parse_repeat(&repeat.to_string_lossy())?;
+        let runs = match runs.to_string_lossy().as_ref() {
+            "forever" if repeat != schedule::Repeat::Once => None,
+            "forever" => Some(1),
+            n => Some(n.parse::<u32>().ok().filter(|n| *n > 0).ok_or("runs must be a positive number or forever")?),
+        };
+        let runs = if repeat == schedule::Repeat::Once { Some(1) } else { runs };
+        let first = schedule::parse_zdt(&first.to_string_lossy()).ok_or("bad first-run time")?;
+        let args = jobs::parse_job(argv.to_vec())?;
+        let args = args.to_argv().into_iter()
+            .map(|a| a.into_string().map_err(|_| "paths that aren't valid UTF-8 can't be scheduled".to_string()))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Schedule { name, args, repeat: repeat.to_text(), runs, done: 0, next: Some(first.to_string()), history: Vec::new() })
+    })();
+    let mut new = match parsed {
+        Ok(s) => s,
+        Err(e) => {
+            reply.err(&format!("Error: {}", e))?;
+            return Ok(2);
+        }
+    };
+    let mut st = d.lock();
+    let existing = st.schedules.iter().position(|s| s.name == new.name);
+    match (existing, replace) {
+        (Some(_), false) => {
+            reply.err(&format!("a scheduled job named '{}' already exists (edit it with -e)", new.name))?;
+            return Ok(1);
+        }
+        (None, true) => {
+            reply.err(&format!("no scheduled job '{}'", new.name))?;
+            return Ok(1);
+        }
+        (Some(i), true) => {
+            let old = st.schedules.remove(i);
+            new.done = old.done;
+            new.history = old.history;
+            if new.runs.is_some_and(|n| new.done >= n) {
+                new.next = None;
+            }
+            st.schedules.insert(i, new.clone());
+        }
+        (None, false) => st.schedules.push(new.clone()),
+    }
+    save_schedules(&st.schedules);
+    drop(st);
+    d.sched_wake.notify_all();
+    let verb = if replace { "updated" } else { "added" };
+    let next = new.next_time().map(|t| schedule::show(&t)).unwrap_or_else(|| "none".into());
+    event(&format!("schedule {} {}: {} ({}), next run {}", new.name, verb, schedule::shell_join(&new.args), new.regularity(), next));
+    reply.out(&format!("scheduled job '{}' {}; next run {}", new.name, verb, next))?;
+    Ok(0)
+}
+
+fn schedule_rm(d: &Daemon, reply: &mut Reply, name: &str) -> io::Result<i32> {
+    let mut st = d.lock();
+    let Some(i) = st.schedules.iter().position(|s| s.name == name) else {
+        reply.err(&format!("no scheduled job '{}'", name))?;
+        return Ok(1);
+    };
+    st.schedules.remove(i);
+    // runs it already submitted but that haven't started go too; a running one finishes
+    let waiting: Vec<JobId> = st.q.waiting().iter()
+        .filter(|(j, _)| j.schedule.as_deref() == Some(name))
+        .map(|(j, _)| j.id)
+        .collect();
+    for id in &waiting {
+        st.q.remove_waiting(*id);
+    }
+    save_schedules(&st.schedules);
+    save(&st.q);
+    drop(st);
+    event(&format!("schedule {} removed", name));
+    reply.out(&format!("scheduled job '{}' removed (its logs are kept in {})", name, jobs::scheduled_log_dir(name).display()))?;
+    Ok(0)
+}
+
+fn schedule_log(d: &Daemon, reply: &mut Reply, name: &str) -> io::Result<i32> {
+    let logs = jobs::list_logs(&jobs::scheduled_log_dir(name));
+    let Some(path) = logs.last() else {
+        reply.err(&format!("no logs for scheduled job '{}'", name))?;
+        return Ok(1);
+    };
+    if logs.len() > 1 {
+        reply.err(&format!("(latest of {} runs; older logs are in {})", logs.len(), jobs::scheduled_log_dir(name).display()))?;
+    }
+    follow(d, reply, path)
 }
 
 fn shutdown() -> ! {

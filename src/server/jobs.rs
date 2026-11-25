@@ -20,10 +20,33 @@ pub struct Job {
     pub id: JobId,
     pub args: Args,
     pub submitted: SystemTime,
+    /// the schedule that started this run, if any
+    pub schedule: Option<String>,
 }
 
 pub fn logs_dir() -> PathBuf {
     server_dir().join("logs")
+}
+
+/// logs/ for submitted jobs, logs/scheduled/<name>/ for scheduled runs.
+pub fn log_dir_for(job: &Job) -> PathBuf {
+    match &job.schedule {
+        Some(name) => scheduled_log_dir(name),
+        None => logs_dir(),
+    }
+}
+
+pub fn scheduled_log_dir(name: &str) -> PathBuf {
+    logs_dir().join("scheduled").join(name)
+}
+
+/// logs/ and every logs/scheduled/<name>/.
+fn all_log_dirs() -> Vec<PathBuf> {
+    let mut v = vec![logs_dir()];
+    if let Ok(rd) = fs::read_dir(logs_dir().join("scheduled")) {
+        v.extend(rd.flatten().map(|e| e.path()).filter(|p| p.is_dir()));
+    }
+    v
 }
 
 /// Parses and checks one job's arguments (as typed after `tard server`).
@@ -108,8 +131,15 @@ pub fn list_logs(dir: &Path) -> Vec<PathBuf> {
     v
 }
 
-/// Logs for a job id, or for an input name (with or without its extension), oldest first.
-pub fn find_logs(dir: &Path, key: &str) -> Vec<PathBuf> {
+/// Logs for a job id, or for an input name (with or without its extension), oldest
+/// first, from every log directory.
+pub fn find_logs(key: &str) -> Vec<PathBuf> {
+    let mut v: Vec<PathBuf> = all_log_dirs().iter().flat_map(|d| find_logs_in(d, key)).collect();
+    v.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
+    v
+}
+
+fn find_logs_in(dir: &Path, key: &str) -> Vec<PathBuf> {
     let id: Option<JobId> = key.parse().ok();
     let key_stem = Path::new(key).file_stem().and_then(|s| s.to_str()).unwrap_or(key);
     list_logs(dir).into_iter().filter(|p| {
@@ -122,8 +152,8 @@ pub fn find_logs(dir: &Path, key: &str) -> Vec<PathBuf> {
     }).collect()
 }
 
-pub fn max_logged_id(dir: &Path) -> JobId {
-    list_logs(dir).iter()
+pub fn max_logged_id() -> JobId {
+    all_log_dirs().iter().flat_map(|d| list_logs(d))
         .filter_map(|p| parse_log_name(p.file_name()?.to_str()?).map(|(id, _)| id))
         .max()
         .unwrap_or(0)
@@ -140,9 +170,10 @@ pub fn prune_logs(dir: &Path, keep: usize, protect: &[&Path]) {
 
 // Queue persistence: saved on every change, so the queue survives a stop or crash.
 // Format: MAGIC, then per job: u64 id, u64 submitted (unix secs), u64 chain, u32 group,
-// u8 lane (0 main, 1 express, 2 paused), u32 argc, then each arg as u32 length + bytes.
+// u8 lane (0 main, 1 express, 2 paused), schedule name (u32 length + bytes, empty for
+// none), u32 argc, then each arg as u32 length + bytes.
 
-const MAGIC: &[u8] = b"tard-queue-1\n";
+const MAGIC: &[u8] = b"tard-queue-2\n";
 
 pub fn queue_path() -> PathBuf {
     server_dir().join("queue")
@@ -157,6 +188,9 @@ pub fn save_queue(entries: &[(&Job, ChainId, usize, Option<Lane>)]) -> io::Resul
         b.extend_from_slice(&chain.to_le_bytes());
         b.extend_from_slice(&(*group as u32).to_le_bytes());
         b.push(match lane { Some(Lane::Main) => 0, Some(Lane::Express) => 1, None => 2 });
+        let sched = j.schedule.as_deref().unwrap_or("").as_bytes();
+        b.extend_from_slice(&(sched.len() as u32).to_le_bytes());
+        b.extend_from_slice(sched);
         let argv = j.args.to_argv();
         b.extend_from_slice(&(argv.len() as u32).to_le_bytes());
         for a in argv {
@@ -182,19 +216,22 @@ pub fn load_queue() -> (Vec<(Job, ChainId, usize, Option<Lane>)>, Vec<(JobId, St
         return (jobs, bad);
     };
     while !r.is_empty() {
-        let Some((id, secs, chain, group, lane, argv)) = read_job(&mut r) else {
+        let Some((id, secs, chain, group, lane, schedule, argv)) = read_job(&mut r) else {
             bad.push((0, "queue file is corrupt; the rest of it was skipped".to_string()));
             break;
         };
         match parse_job(argv) {
-            Ok(args) => jobs.push((Job { id, args, submitted: UNIX_EPOCH + Duration::from_secs(secs) }, chain, group, lane)),
+            Ok(args) => {
+                let job = Job { id, args, submitted: UNIX_EPOCH + Duration::from_secs(secs), schedule };
+                jobs.push((job, chain, group, lane));
+            }
             Err(e) => bad.push((id, e)),
         }
     }
     (jobs, bad)
 }
 
-type Entry = (JobId, u64, ChainId, usize, Option<Lane>, Vec<OsString>);
+type Entry = (JobId, u64, ChainId, usize, Option<Lane>, Option<String>, Vec<OsString>);
 
 fn read_job(r: &mut &[u8]) -> Option<Entry> {
     fn take<'a>(r: &mut &'a [u8], n: usize) -> Option<&'a [u8]> {
@@ -210,13 +247,16 @@ fn read_job(r: &mut &[u8]) -> Option<Entry> {
     let chain = u64_(r)?;
     let group = u32_(r)? as usize;
     let lane = match take(r, 1)?[0] { 0 => Some(Lane::Main), 1 => Some(Lane::Express), 2 => None, _ => return None };
+    let slen = u32_(r)? as usize;
+    let sched = String::from_utf8(take(r, slen)?.to_vec()).ok()?;
+    let schedule = (!sched.is_empty()).then_some(sched);
     let argc = u32_(r)? as usize;
     let mut argv = Vec::with_capacity(argc.min(64));
     for _ in 0..argc {
         let len = u32_(r)? as usize;
         argv.push(bytes_to_path(take(r, len)?.to_vec()).ok()?.into_os_string());
     }
-    Some((id, secs, chain, group, lane, argv))
+    Some((id, secs, chain, group, lane, schedule, argv))
 }
 
 // Chains and edits on the command line
@@ -380,10 +420,9 @@ mod tests {
         for (t, id, name) in [("01", 1, "photos"), ("02", 2, "photos.tard"), ("03", 3, "music")] {
             fs::write(dir.join(format!("2026-11-24_19-18-{}_{}_{}.log", t, id, name)), "").unwrap();
         }
-        assert_eq!(find_logs(&dir, "2").len(), 1);
-        assert_eq!(find_logs(&dir, "photos").len(), 2);
-        assert_eq!(find_logs(&dir, "photos.tard").len(), 2);
-        assert_eq!(max_logged_id(&dir), 3);
+        assert_eq!(find_logs_in(&dir, "2").len(), 1);
+        assert_eq!(find_logs_in(&dir, "photos").len(), 2);
+        assert_eq!(find_logs_in(&dir, "photos.tard").len(), 2);
         let oldest = list_logs(&dir)[0].clone();
         prune_logs(&dir, 1, &[&oldest]);
         let left = list_logs(&dir);
