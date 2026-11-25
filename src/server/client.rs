@@ -378,7 +378,7 @@ Run tard jobs from a background server. Settings live in {}.
 Jobs:
   <INPUT> <OUTPUT_DIR> [OPTIONS]
              Queue a job, starting the server if needed. Takes the same options
-             as tard itself (-a, -x, -c, -v, -r, -n); see tard -h. Without -r/-n
+             as tard itself (-a, -x, -c, -v, -r, -n, -l); see tard -h. Without -r/-n
              the server sizes the job from what's free
   JOB -q JOB Run the second job after the first (and so on). If a job fails,
              the rest of its chain is skipped
